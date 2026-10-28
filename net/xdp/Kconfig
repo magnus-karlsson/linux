@@ -14,3 +14,15 @@ config XDP_SOCKETS_DIAG
 	help
 	  Support for PF_XDP sockets monitoring interface used by the ss tool.
 	  If unsure, say Y.
+
+config XDP_SOCKETS_USO_KUNIT_TEST
+	tristate "AF_XDP USO header validation tests" if !KUNIT_ALL_TESTS
+	depends on XDP_SOCKETS && KUNIT
+	default KUNIT_ALL_TESTS
+	help
+	  KUnit tests for the helpers that validate and prepare AF_XDP UDP
+	  segmentation offload (USO) requests in copy and zero-copy mode:
+	  header validation, metadata snapshots, segment limits and the
+	  preparation of headers and checksum seeds for segmentation.
+
+	  If unsure, say N.
