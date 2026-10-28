@@ -89,6 +89,10 @@ struct xsk_buff_pool {
 	bool uses_need_wakeup;
 	bool unaligned;
 	bool tx_sw_csum;
+	/* USO requests accepted: Ethernet device without SW checksum, and
+	 * driver support in zero-copy mode. Set when the pool is bound.
+	 */
+	bool tx_uso_supported;
 	void *addrs;
 	/* Mutual exclusion of the completion ring in the SKB mode.
 	 * Protect: NAPI TX thread and sendmsg error paths in the SKB

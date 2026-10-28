@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 
+#include <linux/if_arp.h>
 #include <linux/netdevice.h>
 #include <net/netdev_lock.h>
 #include <net/xsk_buff_pool.h>
@@ -192,6 +193,8 @@ int xp_assign_dev(struct xsk_buff_pool *pool,
 	err = xsk_reg_pool_at_qid(netdev, pool, queue_id);
 	if (err)
 		return err;
+	pool->tx_uso_supported = !pool->tx_sw_csum &&
+				 netdev->type == ARPHRD_ETHER;
 
 	if (mbuf)
 		pool->umem->flags |= XDP_UMEM_SG_FLAG;
@@ -260,6 +263,7 @@ int xp_assign_dev(struct xsk_buff_pool *pool,
 		goto err_unreg_xsk;
 	}
 	pool->umem->zc = true;
+	pool->tx_uso_supported = false;
 	pool->xdp_zc_max_segs = netdev->xdp_zc_max_segs;
 	return 0;
 
