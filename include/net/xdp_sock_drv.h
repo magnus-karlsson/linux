@@ -258,6 +258,7 @@ xsk_buff_raw_get_ctx(const struct xsk_buff_pool *pool, u64 addr, u32 options)
 		XDP_TXMD_FLAGS_TIMESTAMP | \
 		XDP_TXMD_FLAGS_CHECKSUM | \
 		XDP_TXMD_FLAGS_LAUNCH_TIME | \
+		XDP_TXMD_FLAGS_USO | \
 	0)
 
 static inline bool
@@ -265,6 +266,10 @@ xsk_buff_valid_tx_metadata(const struct xsk_buff_pool *pool,
 			   const struct xsk_tx_metadata *meta, u64 *flags)
 {
 	*flags = READ_ONCE(meta->flags);
+	if (*flags & XDP_TXMD_FLAGS_USO)
+		if (pool->umem->zc || pool->tx_metadata_len <
+		    offsetofend(struct xsk_tx_metadata, request.network_offset))
+			return false;
 	if (*flags & XDP_TXMD_FLAGS_LAUNCH_TIME)
 		if (pool->tx_metadata_len <
 		    offsetofend(struct xsk_tx_metadata, request.launch_time))
