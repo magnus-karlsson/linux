@@ -9,6 +9,17 @@
 
 struct ice_vsi;
 
+static inline void ice_xsk_setup_metadata(struct net_device *netdev)
+{
+#ifdef CONFIG_XDP_SOCKETS
+	static const struct xsk_tx_metadata_ops ops = {
+		.tmo_supports_uso = true,
+	};
+
+	netdev->xsk_tx_metadata_ops = &ops;
+#endif
+}
+
 #ifdef CONFIG_XDP_SOCKETS
 int ice_xsk_pool_setup(struct ice_vsi *vsi, struct xsk_buff_pool *pool,
 		       u16 qid);

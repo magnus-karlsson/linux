@@ -92,6 +92,7 @@ enum ice_tx_buf_type {
 	ICE_TX_BUF_XDP_TX,
 	ICE_TX_BUF_XDP_XMIT,
 	ICE_TX_BUF_XSK_TX,
+	ICE_TX_BUF_XSK_USO,
 };
 
 struct ice_tx_buf {
@@ -106,6 +107,7 @@ struct ice_tx_buf {
 		struct xdp_buff *xdp;	/* used for XDP_TX ZC */
 	};
 	unsigned int bytecount;
+	u16 xsk_completions;
 	union {
 		unsigned int gso_segs;
 		unsigned int nr_frags;	/* used for mbuf XDP */
@@ -352,6 +354,10 @@ struct ice_tx_ring {
 	struct device *dev;		/* Used for DMA mapping */
 	u8 __iomem *tail;
 	struct ice_tx_buf *tx_buf;
+	void *xsk_uso_slots;
+	dma_addr_t xsk_uso_slots_dma;
+	size_t xsk_uso_slots_size;
+	u32 xsk_uso_slot_stride;
 
 	struct ice_q_vector *q_vector;	/* Backreference to associated vector */
 	struct net_device *netdev;	/* netdev ring maps to */

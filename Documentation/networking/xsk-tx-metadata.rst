@@ -77,7 +77,8 @@ UDP Segmentation
 ================
 
 To request hardware UDP segmentation offload (USO), bind the socket in
-``XDP_COPY`` mode and set ``XDP_TXMD_FLAGS_USO | XDP_TXMD_FLAGS_CHECKSUM``
+``XDP_COPY`` mode, or ``XDP_ZEROCOPY`` mode on a supporting driver, and set
+``XDP_TXMD_FLAGS_USO | XDP_TXMD_FLAGS_CHECKSUM``
 in the Tx metadata. Reserve at least 16 bytes of metadata and set
 ``XDP_TX_METADATA`` on the first descriptor of the packet.
 
@@ -106,6 +107,12 @@ offload is enabled. There is no software segmentation fallback.
 
 USO cannot be combined with ``XDP_UMEM_TX_SW_CSUM`` or
 ``XDP_TXMD_FLAGS_TIMESTAMP``.
+
+For zero-copy mode, query ``tx-uso-zc`` through the netdev netlink interface
+before submitting requests. Supporting drivers copy headers into kernel-owned
+memory for validation and hardware preparation while leaving payload bytes
+in UMEM. Completion returns each submitted buffer address once, regardless
+of the number of generated datagrams.
 
 Launch Time
 ===========
@@ -198,6 +205,8 @@ Query the ``xsk-features`` attribute in
 - ``tx-timestamp``: device supports ``XDP_TXMD_FLAGS_TIMESTAMP``
 - ``tx-checksum``: device supports ``XDP_TXMD_FLAGS_CHECKSUM``
 - ``tx-launch-time-fifo``: device supports ``XDP_TXMD_FLAGS_LAUNCH_TIME``
+- ``tx-uso-skb``: hardware UDP segmentation is enabled for copy-mode skb
+  transmission; individual requests remain subject to device limits
 
 See ``tools/net/ynl/samples/netdev.c`` on how to query this information.
 

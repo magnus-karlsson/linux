@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0
 #include <linux/if_vlan.h>
 #include <linux/unaligned.h>
+#include <net/gso.h>
 #include <net/ip.h>
 #include <net/ipv6.h>
 #include <net/udp.h>
+#include <net/xdp_sock_drv.h>
 #include <net/xsk_tx_uso.h>
 
 /**
@@ -87,3 +89,87 @@ int xsk_tx_uso_validate(const void *header, struct xsk_tx_uso_info *uso, u32 mtu
 	return 0;
 }
 EXPORT_SYMBOL_GPL(xsk_tx_uso_validate);
+
+/**
+ * xsk_tx_uso_parse - snapshot and validate an AF_XDP USO packet
+ * @pool: pool owning the validated descriptors
+ * @descs: kernel-owned descriptors, starting at the beginning of a packet
+ * @nr: nonzero number of descriptors, including the final EOP descriptor
+ * @uso: caller-provided storage for the packet metadata and header
+ *
+ * Metadata is snapshotted before using its offsets. The packet header is
+ * copied exactly once, before any parsing. The storage must remain valid until
+ * DMA completes if this packet is transmitted.
+ *
+ * Return: @uso on success, NULL without USO, or an ERR_PTR on failure.
+ */
+struct xsk_tx_uso *xsk_tx_uso_parse(struct xsk_buff_pool *pool, const struct xdp_desc *descs,
+				    u32 nr, struct xsk_tx_uso *uso)
+{
+	struct xsk_tx_metadata *user_meta;
+	struct xsk_tx_metadata *meta = &uso->info.metadata;
+	u32 header_len, len = 0, i;
+	u64 flags;
+	int err;
+
+	user_meta = xsk_buff_get_metadata(pool, descs->addr, descs->options);
+	if (!user_meta)
+		return NULL;
+	memcpy(meta, user_meta, min_t(size_t, pool->tx_metadata_len, sizeof(*meta)));
+	if (!(meta->flags & XDP_TXMD_FLAGS_USO))
+		return NULL;
+	if (!xsk_buff_valid_tx_metadata(pool, meta, &flags) ||
+	    !(flags & XDP_TXMD_FLAGS_CHECKSUM) ||
+	    (flags & (XDP_TXMD_FLAGS_TIMESTAMP | XDP_TXMD_FLAGS_LAUNCH_TIME)) ||
+	    !pool->tx_uso_supported)
+		return ERR_PTR(-EOPNOTSUPP);
+
+	if (!meta->request.gso_size || meta->request.gso_size == GSO_BY_FRAGS ||
+	    meta->request.network_offset < ETH_HLEN ||
+	    meta->request.csum_start < meta->request.network_offset ||
+	    meta->request.csum_offset != offsetof(struct udphdr, check))
+		return ERR_PTR(-EINVAL);
+	header_len = (u32)meta->request.csum_start + sizeof(struct udphdr);
+	if (header_len > XSK_TX_USO_MAX_HEADER || header_len > descs->len)
+		return ERR_PTR(-EINVAL);
+	for (i = 0; i < nr; i++) {
+		if (check_add_overflow(len, descs[i].len, &len) ||
+		    xsk_is_eop_desc(&descs[i]) != (i == nr - 1))
+			return ERR_PTR(-EINVAL);
+	}
+
+	uso->info.header_len = header_len;
+	uso->info.len = len;
+	memcpy(xsk_tx_uso_header(uso), xsk_buff_raw_get_data(pool, descs->addr),
+	       header_len);
+	err = xsk_tx_uso_validate(xsk_tx_uso_header(uso), &uso->info,
+				  READ_ONCE(pool->netdev->mtu));
+	if (err)
+		return ERR_PTR(err);
+	return uso;
+}
+EXPORT_SYMBOL_GPL(xsk_tx_uso_parse);
+
+/**
+ * xsk_tx_uso_prepare_headers - prepare the copied header for hardware USO
+ * @uso: validated packet returned by xsk_tx_uso_parse()
+ *
+ * Call once after validation and before syncing the header for DMA. Removes the aggregate
+ * length from the partial UDP checksum seed and clears IP length/checksum
+ * fields for the segmentation engine. Single-datagram headers are unchanged.
+ */
+void xsk_tx_uso_prepare_headers(struct xsk_tx_uso *uso)
+{
+	struct udphdr *uh;
+	const struct xsk_tx_metadata *meta = &uso->info.metadata;
+	void *header;
+
+	header = xsk_tx_uso_header(uso);
+	uh = header + meta->request.csum_start;
+	if (uso->info.gso_segs == 1)
+		return;
+	xsk_tx_prepare_gso_headers(NULL, NULL, 0,
+				   header + meta->request.network_offset, &uh->check,
+				   uso->info.len - meta->request.csum_start);
+}
+EXPORT_SYMBOL_GPL(xsk_tx_uso_prepare_headers);
