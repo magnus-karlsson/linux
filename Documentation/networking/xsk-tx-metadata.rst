@@ -55,6 +55,9 @@ The flags field enables the particular offload:
   packet for transmission at a pre-determined time called launch time. The
   value of launch time is indicated by ``request.launch_time`` field of
   ``struct xsk_tx_metadata``.
+- ``XDP_TXMD_FLAGS_USO``: requests hardware UDP segmentation.
+  ``request.gso_size`` specifies UDP payload bytes per output datagram;
+  ``request.network_offset`` identifies the IP header.
 
 Besides the flags above, in order to trigger the offloads, the first
 packet's ``struct xdp_desc`` descriptor should set ``XDP_TX_METADATA``
@@ -69,6 +72,69 @@ For development and testing purposes it's possible to pass
 In this case, when running in ``XDP_COPY`` mode, the TX checksum
 is calculated on the CPU. Do not enable this option in production because
 it will negatively affect performance.
+
+ice Zero-Copy TX Checksum
+========================
+
+The ice driver supports checksum-only requests with
+``XDP_TXMD_FLAGS_CHECKSUM`` in ``XDP_ZEROCOPY`` mode. Query ``tx-checksum``
+through the netdev netlink interface before submitting requests.
+
+Supported packets contain Ethernet (optionally VLAN tagged), unfragmented
+IPv4 or IPv6 without extension headers, and UDP, TCP, or SCTP. All headers
+must fit in the first buffer and within the driver's 256-byte header limit.
+The checksum start must identify the transport header and the checksum
+offset must identify its checksum field. IP and UDP lengths must describe
+the submitted packet. Supply a valid IPv4 header checksum; for UDP and TCP,
+initialize the transport checksum with the partial pseudoheader checksum
+seed.
+
+The driver validates a kernel-owned header copy and transmits that copy
+with the payload in UMEM. Multi-buffer packets are supported, subject to
+the hardware's eight-data-buffer limit including the copied header.
+``request.network_offset`` and ``request.gso_size`` are ignored for
+checksum-only requests. Timestamp and launch-time requests are not supported.
+
+UDP Segmentation
+================
+
+To request hardware UDP segmentation offload (USO), bind the socket in
+``XDP_COPY`` mode, or ``XDP_ZEROCOPY`` mode on a supporting driver, and set
+``XDP_TXMD_FLAGS_USO | XDP_TXMD_FLAGS_CHECKSUM``
+in the Tx metadata. Reserve at least 16 bytes of metadata and set
+``XDP_TX_METADATA`` on the first descriptor of the packet.
+
+Submit an Ethernet frame containing one IP header, one UDP header, and the
+aggregate UDP payload. Set ``request.network_offset`` to the IP header
+offset, ``request.csum_start`` to the UDP header offset, and
+``request.csum_offset`` to the UDP checksum field offset (6 bytes).
+Header offsets are measured from the first descriptor's packet-data address,
+excluding metadata. Set ``request.gso_size`` to the number of UDP payload
+bytes per output datagram, excluding headers; the last datagram may be
+shorter.
+
+The IP and UDP lengths must describe the aggregate packet. Initialize the
+UDP checksum field with the partial pseudoheader checksum seed for that
+packet. Hardware generates the per-datagram lengths and UDP checksums and,
+for IPv4 segmentation, the IP header checksums. Supply a valid IPv4 header
+checksum as well, since a request that fits in one datagram uses ordinary
+checksum offload without segmentation.
+
+All headers through UDP must be in the first buffer. Multi-buffer packets
+use ``XDP_USE_SG`` and ``XDP_PKT_CONTD``, with metadata only on the first
+descriptor. Each output IP packet must fit the device MTU, and requests
+remain subject to the device's segmentation limits. Query
+``tx-udp-segmentation`` through ethtool to check whether skb UDP segmentation
+offload is enabled. There is no software segmentation fallback.
+
+USO cannot be combined with ``XDP_UMEM_TX_SW_CSUM`` or
+``XDP_TXMD_FLAGS_TIMESTAMP``.
+
+For zero-copy mode, query ``tx-uso-zc`` through the netdev netlink interface
+before submitting requests. Supporting drivers copy headers into kernel-owned
+memory for validation and hardware preparation while leaving payload bytes
+in UMEM. Completion returns each submitted buffer address once, regardless
+of the number of generated datagrams.
 
 Launch Time
 ===========
@@ -127,6 +193,29 @@ cycle time is set to 1 second, the horizon of the launch time ranges
 from 1 second to 2 seconds, depending on where the Qbv cycle is currently
 running.
 
+USO with launch time
+====================
+
+Add ``XDP_TXMD_FLAGS_LAUNCH_TIME`` to the USO and checksum flags and set
+``request.launch_time`` to schedule the segmented packet. This combination
+requires at least 24 bytes of Tx metadata.
+
+The launch time applies to the start of the segmented packet: the first
+output UDP datagram is scheduled, and subsequent datagrams follow according
+to the device's scheduling rules. This does not request per-datagram pacing
+or separate launch times.
+
+The skb path passes one GSO skb and its launch time to the driver without
+software segmentation or ETF scheduling. The driver and selected queue
+must support UDP segmentation and launch time together. Separate support
+for either offload does not establish support for their combination.
+As with ordinary launch-time requests, drivers may ignore the time when
+scheduling is disabled or unsupported. Acceptance or Tx completion alone
+does not prove that a packet was transmitted at the requested time.
+
+The clock, queue configuration, and scheduling horizon requirements above
+also apply to USO launch-time requests.
+
 Querying Device Capabilities
 ============================
 
@@ -138,6 +227,8 @@ Query the ``xsk-features`` attribute in
 - ``tx-timestamp``: device supports ``XDP_TXMD_FLAGS_TIMESTAMP``
 - ``tx-checksum``: device supports ``XDP_TXMD_FLAGS_CHECKSUM``
 - ``tx-launch-time-fifo``: device supports ``XDP_TXMD_FLAGS_LAUNCH_TIME``
+- ``tx-uso-skb``: hardware UDP segmentation is enabled for copy-mode skb
+  transmission; individual requests remain subject to device limits
 
 See ``tools/net/ynl/samples/netdev.c`` on how to query this information.
 

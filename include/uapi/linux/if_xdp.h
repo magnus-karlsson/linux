@@ -134,6 +134,12 @@ struct xdp_options {
  */
 #define XDP_TXMD_FLAGS_LAUNCH_TIME		(1 << 2)
 
+/* Request hardware UDP segmentation offload. Requires CHECKSUM.
+ * Segment size and IP header offset are in request.
+ * With LAUNCH_TIME, scheduling applies to the start of the segmented packet.
+ */
+#define XDP_TXMD_FLAGS_USO			(1 << 3)
+
 /* AF_XDP offloads request. 'request' union member is consumed by the driver
  * when the packet is being transmitted. 'completion' union member is
  * filled by the driver when the transmit completion arrives.
@@ -149,7 +155,12 @@ struct xsk_tx_metadata {
 			__u16 csum_start;
 			/* Offset from csum_start where checksum should be stored. */
 			__u16 csum_offset;
-			__u32 reserved;
+
+			/* XDP_TXMD_FLAGS_USO */
+			/* UDP payload bytes per output datagram. */
+			__u16 gso_size;
+			/* IP header offset from desc->addr. */
+			__u16 network_offset;
 
 			/* XDP_TXMD_FLAGS_LAUNCH_TIME */
 			/* Launch time in nanosecond against the PTP HW Clock */

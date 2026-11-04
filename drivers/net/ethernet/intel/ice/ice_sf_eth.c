@@ -54,6 +54,7 @@ static int ice_sf_cfg_netdev(struct ice_dynamic_port *dyn_port,
 			       NETDEV_XDP_ACT_XSK_ZEROCOPY |
 			       NETDEV_XDP_ACT_RX_SG;
 	netdev->xdp_zc_max_segs = ICE_MAX_BUF_TXD;
+	ice_xsk_setup_metadata(netdev);
 
 	eth_hw_addr_set(netdev, dyn_port->hw_addr);
 	ether_addr_copy(netdev->perm_addr, dyn_port->hw_addr);

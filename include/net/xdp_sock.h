@@ -113,12 +113,17 @@ struct xdp_sock {
  *     Called when AF_XDP frame requested launch time HW offload support.
  *     launch_time indicates the PTP time at which the device can schedule the
  *     packet for transmission.
+ *
+ * bool tmo_supports_uso
+ *     The driver handles USO using a kernel-owned header snapshot rather than
+ *     the optional metadata callback dispatcher.
  */
 struct xsk_tx_metadata_ops {
 	void	(*tmo_request_timestamp)(void *priv);
 	u64	(*tmo_fill_timestamp)(void *priv);
 	void	(*tmo_request_checksum)(u16 csum_start, u16 csum_offset, void *priv);
 	void	(*tmo_request_launch_time)(u64 launch_time, void *priv);
+	bool	tmo_supports_uso;
 };
 
 #ifdef CONFIG_XDP_SOCKETS

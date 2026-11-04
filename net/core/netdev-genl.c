@@ -58,6 +58,8 @@ XDP_METADATA_KFUNC_xxx
 			xsk_features |= NETDEV_XSK_FLAGS_TX_CHECKSUM;
 		if (netdev->xsk_tx_metadata_ops->tmo_request_launch_time)
 			xsk_features |= NETDEV_XSK_FLAGS_TX_LAUNCH_TIME_FIFO;
+		if (netdev->xsk_tx_metadata_ops->tmo_supports_uso)
+			xsk_features |= NETDEV_XSK_FLAGS_TX_USO_ZC;
 	}
 
 	if (nla_put_u32(rsp, NETDEV_A_DEV_IFINDEX, netdev->ifindex) ||

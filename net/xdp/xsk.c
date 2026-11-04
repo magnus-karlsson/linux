@@ -12,6 +12,7 @@
 #define pr_fmt(fmt) "AF_XDP: %s: " fmt, __func__
 
 #include <linux/if_xdp.h>
+#include <linux/if_arp.h>
 #include <linux/init.h>
 #include <linux/sched/mm.h>
 #include <linux/sched/signal.h>
@@ -26,11 +27,13 @@
 #include <linux/vmalloc.h>
 
 #include <net/netdev_queues.h>
+#include <net/udp.h>
 #include <net/xdp_sock_drv.h>
 #include <net/busy_poll.h>
 #include <net/netdev_lock.h>
 #include <net/netdev_rx_queue.h>
 #include <net/xdp.h>
+#include <net/xsk_tx_uso.h>
 
 #include "../core/dev.h"
 
@@ -985,12 +988,46 @@ static void xsk_drop_skb(struct sk_buff *skb)
 	xs->skb = NULL;
 }
 
+static int xsk_skb_uso(struct sk_buff *skb)
+{
+	struct xsk_tx_uso_info uso = {
+		.metadata.request = {
+			.gso_size = skb_shinfo(skb)->gso_size,
+			.csum_start = skb_transport_offset(skb),
+			.network_offset = skb_network_offset(skb),
+		},
+		.header_len = skb_transport_offset(skb) + sizeof(struct udphdr),
+		.len = skb->len,
+	};
+	int err;
+
+	if (!pskb_may_pull(skb, uso.header_len))
+		return -EINVAL;
+
+	err = xsk_tx_uso_validate(skb->data, &uso, READ_ONCE(skb->dev->mtu));
+	if (err)
+		return err;
+
+	skb_reset_mac_header(skb);
+	skb->protocol = eth_hdr(skb)->h_proto;
+	skb_reset_mac_len(skb);
+	if (uso.gso_segs == 1) {
+		skb_gso_reset(skb);
+		return 0;
+	}
+
+	skb_shinfo(skb)->gso_segs = uso.gso_segs;
+	if (netif_needs_gso(skb, netif_skb_features(skb)))
+		return -EOPNOTSUPP;
+
+	return 0;
+}
+
 static int xsk_skb_metadata(struct sk_buff *skb, void *buffer,
 			    struct xdp_desc *desc, struct xsk_buff_pool *pool,
 			    u32 hr)
 {
 	struct xsk_tx_metadata *meta = NULL;
-	u16 csum_start, csum_offset;
 	u64 flags;
 
 	if (unlikely(pool->tx_metadata_len == 0))
@@ -1000,16 +1037,42 @@ static int xsk_skb_metadata(struct sk_buff *skb, void *buffer,
 	if (unlikely(!xsk_buff_valid_tx_metadata(pool, meta, &flags)))
 		return -EINVAL;
 
-	if (flags & XDP_TXMD_FLAGS_CHECKSUM) {
-		csum_start = READ_ONCE(meta->request.csum_start);
-		csum_offset = READ_ONCE(meta->request.csum_offset);
+	if (flags & XDP_TXMD_FLAGS_USO) {
+		u16 nhoff = READ_ONCE(meta->request.network_offset);
+		u16 offset = READ_ONCE(meta->request.csum_offset);
+		u16 thoff = READ_ONCE(meta->request.csum_start);
+		u16 size = READ_ONCE(meta->request.gso_size);
 
-		if (unlikely(csum_start + csum_offset +
+		if (!(flags & XDP_TXMD_FLAGS_CHECKSUM) || !pool->tx_uso_supported ||
+		    (flags & XDP_TXMD_FLAGS_TIMESTAMP))
+			return -EOPNOTSUPP;
+		if (!size || size == GSO_BY_FRAGS ||
+		    nhoff < ETH_HLEN || thoff < nhoff ||
+		    thoff + sizeof(struct udphdr) > desc->len ||
+		    offset != offsetof(struct udphdr, check) ||
+		    hr + thoff > U16_MAX)
+			return -EINVAL;
+
+		skb_set_network_header(skb, nhoff);
+		skb_set_transport_header(skb, thoff);
+		skb_shinfo(skb)->gso_size = size;
+		skb_shinfo(skb)->gso_type = SKB_GSO_UDP_L4;
+	}
+
+	if (flags & XDP_TXMD_FLAGS_CHECKSUM) {
+		if (flags & XDP_TXMD_FLAGS_USO) {
+			skb->csum_start = skb_transport_offset(skb);
+			skb->csum_offset = offsetof(struct udphdr, check);
+		} else {
+			skb->csum_start = READ_ONCE(meta->request.csum_start);
+			skb->csum_offset = READ_ONCE(meta->request.csum_offset);
+		}
+
+		if (unlikely(skb->csum_start + skb->csum_offset +
 			     sizeof(__sum16) > desc->len))
 			return -EINVAL;
 
-		skb->csum_start = hr + csum_start;
-		skb->csum_offset = csum_offset;
+		skb->csum_start += hr;
 		skb->ip_summed = CHECKSUM_PARTIAL;
 
 		if (unlikely(pool->tx_sw_csum)) {
@@ -1194,13 +1257,16 @@ free_err:
 	if (skb && !xs->skb)
 		kfree_skb(skb);
 
-	if (err == -EOVERFLOW) {
+	if (err == -EOVERFLOW || err == -EINVAL || err == -EOPNOTSUPP) {
 		if (xs->skb) {
 			/* Drop the packet */
 			xsk_inc_num_desc(xs->skb);
 			xsk_drop_skb(xs->skb);
 		} else {
-			xsk_cq_cancel_locked(xs->pool, 1);
+			if (err == -EOVERFLOW)
+				xsk_cq_cancel_locked(xs->pool, 1);
+			else
+				xsk_cq_submit_addr_single_locked(xs->pool, desc);
 			xs->tx->invalid_descs++;
 		}
 		xskq_cons_release(xs->tx);
@@ -1262,7 +1328,8 @@ static int __xsk_generic_xmit(struct sock *sk)
 		skb = xsk_build_skb(xs, &desc);
 		if (IS_ERR(skb)) {
 			err = PTR_ERR(skb);
-			if (err != -EOVERFLOW)
+			if (err != -EOVERFLOW && err != -EINVAL &&
+			    err != -EOPNOTSUPP)
 				goto out;
 			if (xp_mb_desc(&desc))
 				xs->drain_cont = true;
@@ -1275,6 +1342,15 @@ static int __xsk_generic_xmit(struct sock *sk)
 		if (xp_mb_desc(&desc)) {
 			xs->skb = skb;
 			continue;
+		}
+
+		if (skb_shinfo(skb)->gso_type & SKB_GSO_UDP_L4) {
+			err = xsk_skb_uso(skb);
+			if (err) {
+				xsk_drop_skb(skb);
+				err = 0;
+				continue;
+			}
 		}
 
 		err = __dev_direct_xmit(skb, xs->queue_id);

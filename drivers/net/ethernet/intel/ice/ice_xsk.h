@@ -10,6 +10,22 @@
 struct ice_vsi;
 
 #ifdef CONFIG_XDP_SOCKETS
+void ice_xsk_request_checksum(u16 csum_start, u16 csum_offset, void *priv);
+#endif
+
+static inline void ice_xsk_setup_metadata(struct net_device *netdev)
+{
+#ifdef CONFIG_XDP_SOCKETS
+	static const struct xsk_tx_metadata_ops ops = {
+		.tmo_request_checksum = ice_xsk_request_checksum,
+		.tmo_supports_uso = true,
+	};
+
+	netdev->xsk_tx_metadata_ops = &ops;
+#endif
+}
+
+#ifdef CONFIG_XDP_SOCKETS
 int ice_xsk_pool_setup(struct ice_vsi *vsi, struct xsk_buff_pool *pool,
 		       u16 qid);
 int ice_clean_rx_irq_zc(struct ice_rx_ring *rx_ring,
