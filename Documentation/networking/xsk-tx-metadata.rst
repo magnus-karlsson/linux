@@ -73,6 +73,28 @@ In this case, when running in ``XDP_COPY`` mode, the TX checksum
 is calculated on the CPU. Do not enable this option in production because
 it will negatively affect performance.
 
+ice Zero-Copy TX Checksum
+========================
+
+The ice driver supports checksum-only requests with
+``XDP_TXMD_FLAGS_CHECKSUM`` in ``XDP_ZEROCOPY`` mode. Query ``tx-checksum``
+through the netdev netlink interface before submitting requests.
+
+Supported packets contain Ethernet (optionally VLAN tagged), unfragmented
+IPv4 or IPv6 without extension headers, and UDP, TCP, or SCTP. All headers
+must fit in the first buffer and within the driver's 256-byte header limit.
+The checksum start must identify the transport header and the checksum
+offset must identify its checksum field. IP and UDP lengths must describe
+the submitted packet. Supply a valid IPv4 header checksum; for UDP and TCP,
+initialize the transport checksum with the partial pseudoheader checksum
+seed.
+
+The driver validates a kernel-owned header copy and transmits that copy
+with the payload in UMEM. Multi-buffer packets are supported, subject to
+the hardware's eight-data-buffer limit including the copied header.
+``request.network_offset`` and ``request.gso_size`` are ignored for
+checksum-only requests. Timestamp and launch-time requests are not supported.
+
 UDP Segmentation
 ================
 
