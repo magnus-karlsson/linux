@@ -53,6 +53,20 @@ ice_build_ctob(u64 td_cmd, u64 td_offset, unsigned int size, u64 td_tag)
 			   (td_tag    << ICE_TXD_QW1_L2TAG1_S));
 }
 
+static inline u32 ice_build_tx_desc_offset(u32 mac_len, u32 ip_len, u32 l4_len)
+{
+	return (mac_len / 2) << ICE_TX_DESC_LEN_MACLEN_S |
+	       (ip_len / 4) << ICE_TX_DESC_LEN_IPLEN_S |
+	       (l4_len / 4) << ICE_TX_DESC_LEN_L4_LEN_S;
+}
+
+static inline u64 ice_build_tso_ctx_qw1(u32 tso_len, u16 mss)
+{
+	return (u64)ICE_TX_CTX_DESC_TSO << ICE_TXD_CTX_QW1_CMD_S |
+	       (u64)tso_len << ICE_TXD_CTX_QW1_TSO_LEN_S |
+	       (u64)mss << ICE_TXD_CTX_QW1_MSS_S;
+}
+
 /**
  * ice_build_tstamp_desc - build Tx time stamp descriptor
  * @tx_desc: Tx LAN descriptor index
