@@ -558,6 +558,29 @@ void xsk_tx_release(struct xsk_buff_pool *pool)
 }
 EXPORT_SYMBOL(xsk_tx_release);
 
+/**
+ * xsk_tx_invalid_descs - account Tx descriptors rejected by the driver
+ * @pool: buffer pool the descriptors were consumed from
+ * @nb_descs: number of rejected descriptors
+ *
+ * Report descriptors that were consumed from the Tx ring but rejected by the
+ * driver in the tx_invalid_descs statistic. The driver must still complete
+ * them. With a shared umem the owning socket is unknown, so the descriptors
+ * are only accounted when a single socket transmits on @pool.
+ */
+void xsk_tx_invalid_descs(struct xsk_buff_pool *pool, u32 nb_descs)
+{
+	struct xdp_sock *xs;
+
+	rcu_read_lock();
+	xs = list_first_or_null_rcu(&pool->xsk_tx_list, struct xdp_sock,
+				    tx_list);
+	if (xs && list_is_singular(&pool->xsk_tx_list))
+		xs->tx->invalid_descs += nb_descs;
+	rcu_read_unlock();
+}
+EXPORT_SYMBOL(xsk_tx_invalid_descs);
+
 bool xsk_tx_peek_desc(struct xsk_buff_pool *pool, struct xdp_desc *desc)
 {
 	bool budget_exhausted = false;

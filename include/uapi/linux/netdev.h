@@ -62,11 +62,14 @@ enum netdev_xdp_rx_metadata {
  *   driver.
  * @NETDEV_XSK_FLAGS_TX_LAUNCH_TIME_FIFO: Launch time HW offload is supported
  *   by the driver.
+ * @NETDEV_XSK_FLAGS_TX_USO_ZC: UDP segmentation HW offload is supported for
+ *   AF_XDP zero-copy transmission.
  */
 enum netdev_xsk_flags {
 	NETDEV_XSK_FLAGS_TX_TIMESTAMP = 1,
 	NETDEV_XSK_FLAGS_TX_CHECKSUM = 2,
 	NETDEV_XSK_FLAGS_TX_LAUNCH_TIME_FIFO = 4,
+	NETDEV_XSK_FLAGS_TX_USO_ZC = 8,
 };
 
 enum netdev_queue_type {

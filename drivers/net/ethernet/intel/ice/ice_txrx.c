@@ -251,6 +251,7 @@ void ice_free_tx_ring(struct ice_tx_ring *tx_ring)
 	u32 size;
 
 	ice_clean_tx_ring(tx_ring);
+	ice_xsk_free_uso_slots(tx_ring);
 	devm_kfree(tx_ring->dev, tx_ring->tx_buf);
 	tx_ring->tx_buf = NULL;
 

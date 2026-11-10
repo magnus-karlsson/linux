@@ -5,6 +5,7 @@
 #include <linux/unroll.h>
 #include <net/libeth/xdp.h>
 #include <net/xdp_sock_drv.h>
+#include <net/xsk_tx_uso.h>
 #include <net/xdp.h>
 #include "ice.h"
 #include "ice_base.h"
@@ -133,6 +134,14 @@ static int ice_xsk_pool_disable(struct ice_vsi *vsi, u16 qid)
 	return 0;
 }
 
+/* Worst-case HW descriptors per AF_XDP descriptor on the USO path: the data
+ * split into maximum-size buffers plus a context and a header descriptor.
+ */
+static u32 ice_xsk_uso_desc_cost(const struct xsk_buff_pool *pool)
+{
+	return DIV_ROUND_UP(pool->chunk_size, ICE_MAX_DATA_PER_TXD_ALIGNED) + 2;
+}
+
 /**
  * ice_xsk_pool_enable - enable a buffer pool region
  * @vsi: Current VSI
@@ -144,8 +153,6 @@ static int ice_xsk_pool_disable(struct ice_vsi *vsi, u16 qid)
 static int
 ice_xsk_pool_enable(struct ice_vsi *vsi, struct xsk_buff_pool *pool, u16 qid)
 {
-	int err;
-
 	if (vsi->type != ICE_VSI_PF && vsi->type != ICE_VSI_SF)
 		return -EINVAL;
 
@@ -153,12 +160,107 @@ ice_xsk_pool_enable(struct ice_vsi *vsi, struct xsk_buff_pool *pool, u16 qid)
 	    qid >= vsi->netdev->real_num_tx_queues)
 		return -EINVAL;
 
-	err = xsk_pool_dma_map(pool, ice_pf_to_dev(vsi->back),
-			       ICE_RX_DMA_ATTR);
-	if (err)
-		return err;
+	/* The Tx budget must fit a maximum-size packet, or it is never peeked. */
+	if (pool->tx_metadata_len && pool->tx_uso_supported &&
+	    (vsi->num_tx_desc - 1) / ice_xsk_uso_desc_cost(pool) <
+	    vsi->netdev->xdp_zc_max_segs) {
+		netdev_err(vsi->netdev, "Tx ring too small for USO with %u byte chunks\n",
+			   pool->chunk_size);
+		return -EINVAL;
+	}
+
+	return xsk_pool_dma_map(pool, ice_pf_to_dev(vsi->back),
+				ICE_RX_DMA_ATTR);
+}
+
+/**
+ * ice_xsk_free_uso_slots - free the USO header slots of an XDP Tx ring
+ * @ring: XDP Tx ring without outstanding descriptors
+ */
+void ice_xsk_free_uso_slots(struct ice_tx_ring *ring)
+{
+	u32 i;
+
+	if (!ring->xsk_uso_pages)
+		return;
+
+	for (i = 0; i < ring->xsk_uso_nr_pages; i++) {
+		struct ice_xsk_uso_page *page = &ring->xsk_uso_pages[i];
+
+		if (page->addr)
+			dma_free_noncoherent(ring->dev, PAGE_SIZE, page->addr,
+					     page->dma, DMA_TO_DEVICE);
+	}
+	kfree(ring->xsk_uso_pages);
+	ring->xsk_uso_pages = NULL;
+	ring->xsk_uso_nr_pages = 0;
+	ring->xsk_uso_slots_per_page = 0;
+	ring->xsk_uso_slot_stride = 0;
+}
+
+/**
+ * ice_xsk_cfg_uso_slots - match the USO header slots of a ring to its pool
+ * @ring: XDP Tx ring without outstanding descriptors
+ * @pool: buffer pool bound to the ring, or NULL
+ *
+ * Header slots are only needed when USO requests can be submitted. They
+ * belong to the ring, one per two descriptors, and are freed with it. They
+ * are allocated in single pages to avoid a large contiguous allocation.
+ *
+ * Return: 0 on success, -ENOMEM on allocation failure.
+ */
+int ice_xsk_cfg_uso_slots(struct ice_tx_ring *ring, struct xsk_buff_pool *pool)
+{
+	u32 stride = ALIGN(NET_IP_ALIGN + XSK_TX_USO_MAX_HEADER,
+			   dma_get_cache_alignment());
+	u32 per_page = PAGE_SIZE / stride;
+	u32 nr_pages = DIV_ROUND_UP(ring->count / 2, per_page);
+	u32 i;
+
+	if (!pool || !pool->tx_metadata_len || !pool->tx_uso_supported) {
+		ice_xsk_free_uso_slots(ring);
+		return 0;
+	}
+	if (ring->xsk_uso_pages && ring->xsk_uso_nr_pages == nr_pages)
+		return 0;
+
+	ice_xsk_free_uso_slots(ring);
+	ring->xsk_uso_pages = kcalloc(nr_pages, sizeof(*ring->xsk_uso_pages),
+				      GFP_KERNEL);
+	if (!ring->xsk_uso_pages)
+		return -ENOMEM;
+	ring->xsk_uso_nr_pages = nr_pages;
+
+	for (i = 0; i < nr_pages; i++) {
+		struct ice_xsk_uso_page *page = &ring->xsk_uso_pages[i];
+
+		page->addr = dma_alloc_noncoherent(ring->dev, PAGE_SIZE,
+						   &page->dma, DMA_TO_DEVICE,
+						   GFP_KERNEL);
+		if (!page->addr) {
+			ice_xsk_free_uso_slots(ring);
+			return -ENOMEM;
+		}
+	}
+	ring->xsk_uso_slot_stride = stride;
+	ring->xsk_uso_slots_per_page = per_page;
 
 	return 0;
+}
+
+/* Every USO packet takes a context and a header descriptor, so in-flight
+ * context descriptors are never adjacent and, as the ring size is even, half
+ * the context index is a unique header slot. Return the page and set the slot
+ * offset within it.
+ */
+static struct ice_xsk_uso_page *
+ice_xsk_uso_slot(const struct ice_tx_ring *ring, u16 ctx_idx, u32 *offset)
+{
+	u32 slot = ctx_idx >> 1;
+
+	*offset = slot % ring->xsk_uso_slots_per_page *
+		  ring->xsk_uso_slot_stride;
+	return &ring->xsk_uso_pages[slot / ring->xsk_uso_slots_per_page];
 }
 
 /**
@@ -354,6 +456,36 @@ bool ice_alloc_rx_bufs_zc(struct ice_rx_ring *rx_ring,
 	return __ice_alloc_rx_bufs_zc(rx_ring, xsk_pool, leftover);
 }
 
+static u32 ice_clean_xsk_buf(struct ice_tx_ring *ring, struct ice_tx_buf *buf)
+{
+	u32 completed = buf->xsk_completions;
+	struct ice_xsk_uso_page *page;
+	u32 offset;
+
+	switch (buf->type) {
+	case ICE_TX_BUF_EMPTY:
+		return 1;
+	case ICE_TX_BUF_XSK_TX:
+		xsk_buff_free(buf->xdp);
+		ring->xdp_tx_active--;
+		break;
+	case ICE_TX_BUF_XSK_USO:
+		page = ice_xsk_uso_slot(ring, buf - ring->tx_buf, &offset);
+		dma_sync_single_range_for_cpu(ring->dev, page->dma, offset,
+					      ring->xsk_uso_slot_stride,
+					      DMA_TO_DEVICE);
+		ring->xsk_uso_active--;
+		break;
+	case ICE_TX_BUF_XSK_DROP:
+		ring->xsk_uso_active--;
+		break;
+	default:
+		break;
+	}
+	buf->type = ICE_TX_BUF_EMPTY;
+	return completed;
+}
+
 /**
  * ice_clean_xdp_irq_zc - produce AF_XDP descriptors to CQ
  * @xdp_ring: XDP Tx ring
@@ -365,9 +497,8 @@ static u32 ice_clean_xdp_irq_zc(struct ice_tx_ring *xdp_ring,
 	u16 ntc = xdp_ring->next_to_clean;
 	struct ice_tx_desc *tx_desc;
 	u16 cnt = xdp_ring->count;
-	struct ice_tx_buf *tx_buf;
 	u16 completed_frames = 0;
-	u16 xsk_frames = 0;
+	u32 xsk_frames = 0;
 	u16 last_rs;
 	int i;
 
@@ -384,22 +515,14 @@ static u32 ice_clean_xdp_irq_zc(struct ice_tx_ring *xdp_ring,
 	if (!completed_frames)
 		return 0;
 
-	if (likely(!xdp_ring->xdp_tx_active)) {
+	if (likely(!xdp_ring->xsk_uso_active && !xdp_ring->xdp_tx_active)) {
 		xsk_frames = completed_frames;
 		goto skip;
 	}
 
 	ntc = xdp_ring->next_to_clean;
 	for (i = 0; i < completed_frames; i++) {
-		tx_buf = &xdp_ring->tx_buf[ntc];
-
-		if (tx_buf->type == ICE_TX_BUF_XSK_TX) {
-			tx_buf->type = ICE_TX_BUF_EMPTY;
-			xsk_buff_free(tx_buf->xdp);
-			xdp_ring->xdp_tx_active--;
-		} else {
-			xsk_frames++;
-		}
+		xsk_frames += ice_clean_xsk_buf(xdp_ring, &xdp_ring->tx_buf[ntc]);
 
 		ntc++;
 		if (ntc >= xdp_ring->count)
@@ -469,6 +592,7 @@ static int ice_xmit_xdp_tx_zc(struct xdp_buff *xdp,
 
 		tx_buf->xdp = xdp;
 		tx_buf->type = ICE_TX_BUF_XSK_TX;
+		tx_buf->xsk_completions = 0;
 		tx_desc->buf_addr = cpu_to_le64(dma);
 		tx_desc->cmd_type_offset_bsz = ice_build_ctob(0, 0, size, 0);
 		/* account for each xdp_buff from xsk_buff_pool */
@@ -781,6 +905,248 @@ static void ice_fill_tx_hw_ring(struct ice_tx_ring *xdp_ring,
 		ice_xmit_pkt(xdp_ring, xsk_pool, &descs[i], total_bytes);
 }
 
+static void ice_xsk_data_desc(struct ice_tx_ring *ring, dma_addr_t dma,
+			      u32 len, u32 cmd, u32 offset, u32 completions)
+{
+	struct ice_tx_desc *desc = ICE_TX_DESC(ring, ring->next_to_use);
+	struct ice_tx_buf *buf = &ring->tx_buf[ring->next_to_use];
+
+	buf->type = ICE_TX_BUF_XSK_DESC;
+	buf->xsk_completions = completions;
+	desc->buf_addr = cpu_to_le64(dma);
+	desc->cmd_type_offset_bsz = ice_build_ctob(cmd, offset, len, 0);
+	if (++ring->next_to_use == ring->count)
+		ring->next_to_use = 0;
+}
+
+/* Include the copied header in the eight-buffer limit for every wire segment. */
+static bool ice_xsk_uso_fits(const struct xdp_desc *descs, u32 nr,
+			     const struct xsk_tx_uso_info *uso)
+{
+	u16 network_offset = uso->metadata.request.network_offset;
+	u16 transport_offset = uso->metadata.request.csum_start;
+	u16 gso_size = uso->metadata.request.gso_size;
+	u32 remaining = gso_size, buffers = 1, i;
+
+	/* The core does not know the width of the descriptor length fields. */
+	if (network_offset > ICE_TXD_MACLEN_MAX ||
+	    transport_offset - network_offset > ICE_TXD_IPLEN_MAX ||
+	    (uso->gso_segs > 1 &&
+	     (gso_size < ICE_TXD_CTX_MIN_MSS || gso_size > ICE_TXD_CTX_MAX_MSS)))
+		return false;
+
+	for (i = 0; i < nr; i++) {
+		u32 len = descs[i].len - (i ? 0 : uso->header_len);
+
+		while (len) {
+			u32 chunk = min_t(u32, len, ICE_MAX_DATA_PER_TXD_ALIGNED);
+			u32 left = chunk;
+
+			len -= chunk;
+			while (left) {
+				u32 bytes = min(left, remaining);
+
+				if (++buffers > ICE_MAX_BUF_TXD)
+					return false;
+				left -= bytes;
+				remaining -= bytes;
+				if (!remaining) {
+					remaining = gso_size;
+					buffers = 1;
+				}
+			}
+		}
+	}
+	return true;
+}
+
+/* Write the context and header descriptors of a USO packet and return the
+ * command and offset fields for its payload descriptors.
+ */
+static int ice_xsk_xmit_uso_hdr(struct ice_tx_ring *ring,
+				const struct xdp_desc *descs, u32 nr,
+				const struct xsk_tx_uso_info *info, u32 *cmd,
+				u32 *offset)
+{
+	const struct xsk_tx_metadata *meta = &info->metadata;
+	u16 slot_idx = ring->next_to_use;
+	u64 qw1 = ICE_TX_DESC_DTYPE_CTX;
+	struct ice_xsk_uso_page *page;
+	struct ice_tx_ctx_desc *ctx;
+	struct ice_tx_buf *buf;
+	dma_addr_t header_dma;
+	u32 slot_offset;
+	bool eop;
+
+	if (!ice_xsk_uso_fits(descs, nr, info))
+		return -EOPNOTSUPP;
+
+	page = ice_xsk_uso_slot(ring, slot_idx, &slot_offset);
+	header_dma = page->dma + slot_offset + NET_IP_ALIGN;
+
+	xsk_tx_uso_prepare_headers(info, page->addr + slot_offset + NET_IP_ALIGN);
+	dma_sync_single_range_for_device(ring->dev, page->dma, slot_offset,
+					 NET_IP_ALIGN + info->header_len,
+					 DMA_TO_DEVICE);
+
+	*cmd = ICE_TX_DESC_CMD_L4T_EOFT_UDP;
+	if (info->protocol == htons(ETH_P_IP))
+		*cmd |= info->gso_segs > 1 ? ICE_TX_DESC_CMD_IIPT_IPV4_CSUM :
+					  ICE_TX_DESC_CMD_IIPT_IPV4;
+	else
+		*cmd |= ICE_TX_DESC_CMD_IIPT_IPV6;
+	*offset = ice_build_tx_desc_offset(meta->request.network_offset,
+					   meta->request.csum_start -
+					   meta->request.network_offset,
+					   sizeof(struct udphdr));
+
+	/* The context owns the header until the whole submitted batch completes. */
+	buf = &ring->tx_buf[slot_idx];
+	buf->type = ICE_TX_BUF_XSK_USO;
+	buf->xsk_completions = 0;
+	ring->xsk_uso_active++;
+
+	if (info->gso_segs > 1)
+		qw1 |= ice_build_tso_ctx_qw1(info->len - info->header_len,
+					     meta->request.gso_size);
+	ctx = (struct ice_tx_ctx_desc *)ICE_TX_DESC(ring, slot_idx);
+	memset(ctx, 0, sizeof(*ctx));
+	ctx->qw1 = cpu_to_le64(qw1);
+	if (++ring->next_to_use == ring->count)
+		ring->next_to_use = 0;
+
+	eop = info->len == info->header_len;
+	ice_xsk_data_desc(ring, header_dma, info->header_len,
+			  *cmd | (eop ? ICE_TX_DESC_CMD_EOP : 0), *offset,
+			  eop ? nr : 0);
+	return 0;
+}
+
+/* Write the data descriptors of a packet, skipping its first @skip bytes. */
+static void ice_xsk_xmit_descs(struct ice_tx_ring *ring,
+			       struct xsk_buff_pool *pool,
+			       const struct xdp_desc *descs, u32 nr, u32 skip,
+			       u32 cmd, u32 offset)
+{
+	bool split = false;
+	u32 i;
+
+	for (i = 0; i < nr; i++, skip = 0) {
+		u32 len = descs[i].len - skip;
+		dma_addr_t dma;
+
+		if (!len)
+			continue;
+		dma = xsk_buff_raw_get_dma(pool, descs[i].addr) + skip;
+		xsk_buff_raw_dma_sync_for_device(pool, dma, len);
+		while (len) {
+			u32 chunk = min_t(u32, len, ICE_MAX_DATA_PER_TXD_ALIGNED);
+			bool eop = i == nr - 1 && len == chunk;
+
+			split |= len > chunk;
+			ice_xsk_data_desc(ring, dma, chunk,
+					  cmd | (eop ? ICE_TX_DESC_CMD_EOP : 0),
+					  offset, eop ? nr : 0);
+			dma += chunk;
+			len -= chunk;
+		}
+	}
+	/* Split buffers break the one-completion-per-descriptor cleanup
+	 * shortcut, so make the cleanup walk this packet.
+	 */
+	if (unlikely(split)) {
+		u16 last = ring->next_to_use ? ring->next_to_use - 1 : ring->count - 1;
+
+		ring->tx_buf[last].type = ICE_TX_BUF_XSK_DROP;
+		ring->xsk_uso_active++;
+	}
+}
+
+static void ice_xsk_drop_packet(struct ice_tx_ring *ring,
+				struct xsk_buff_pool *pool, u32 nr)
+{
+	xsk_tx_invalid_descs(pool, nr);
+	/* Completion queue entries are published in submission order, so a
+	 * dropped packet must not be completed ahead of descriptors still in
+	 * flight. The ring always keeps one descriptor unused, so equal
+	 * indices mean that nothing is outstanding.
+	 */
+	if (ring->next_to_use != ring->next_to_clean) {
+		u16 last = ring->next_to_use ? ring->next_to_use - 1 : ring->count - 1;
+		struct ice_tx_buf *buf = &ring->tx_buf[last];
+
+		/* XSK_TX buffers already force the slow cleanup path. */
+		if (buf->type == ICE_TX_BUF_EMPTY) {
+			buf->xsk_completions = 1;
+			buf->type = ICE_TX_BUF_XSK_DROP;
+			ring->xsk_uso_active++;
+		} else if (buf->type == ICE_TX_BUF_XSK_DESC) {
+			buf->type = ICE_TX_BUF_XSK_DROP;
+			ring->xsk_uso_active++;
+		}
+		buf->xsk_completions += nr;
+	} else {
+		xsk_tx_completed(pool, nr);
+	}
+}
+
+/* Returns the number of packets queued on the ring. */
+static u32 ice_xmit_zc_metadata(struct ice_tx_ring *ring, struct xsk_buff_pool *pool,
+				u32 count, unsigned int *total_bytes)
+{
+	struct xdp_desc *descs = pool->tx_descs;
+	u32 i = 0, packets = 0;
+
+	while (i < count) {
+		u32 cmd = 0, offset = 0, skip = 0, slot_offset;
+		u32 len = descs[i].len, nr = 1;
+		struct ice_xsk_uso_page *page;
+		struct xsk_tx_uso_info info;
+		int uso;
+
+		while (!xsk_is_eop_desc(&descs[i + nr - 1]) && i + nr < count)
+			len += descs[i + nr++].len;
+		/* The shared-umem fallback can end a batch inside a packet. */
+		if (unlikely(!xsk_is_eop_desc(&descs[i + nr - 1]))) {
+			ice_xsk_drop_packet(ring, pool, nr);
+			break;
+		}
+		page = ice_xsk_uso_slot(ring, ring->next_to_use, &slot_offset);
+		uso = xsk_tx_uso_parse(pool, &descs[i], nr, &info,
+				       page->addr + slot_offset + NET_IP_ALIGN);
+		if (uso < 0 ||
+		    (uso && ice_xsk_xmit_uso_hdr(ring, &descs[i], nr, &info,
+						 &cmd, &offset))) {
+			ice_xsk_drop_packet(ring, pool, nr);
+			i += nr;
+			continue;
+		}
+		if (uso) {
+			skip = info.header_len;
+			*total_bytes += (info.gso_segs - 1) * skip;
+			packets += info.gso_segs - 1;
+		}
+		ice_xsk_xmit_descs(ring, pool, &descs[i], nr, skip, cmd, offset);
+		*total_bytes += len;
+		packets++;
+		i += nr;
+	}
+	return packets;
+}
+
+/**
+ * ice_xsk_setup_metadata - register AF_XDP Tx metadata operations
+ * @netdev: net_device
+ */
+void ice_xsk_setup_metadata(struct net_device *netdev)
+{
+	static const struct xsk_tx_metadata_ops ops = {
+		.tmo_supports_uso = true,
+	};
+
+	netdev->xsk_tx_metadata_ops = &ops;
+}
+
 /**
  * ice_xmit_zc - take entries from XSK Tx ring and place them onto HW Tx ring
  * @xdp_ring: XDP ring to produce the HW Tx descriptors on
@@ -791,9 +1157,9 @@ static void ice_fill_tx_hw_ring(struct ice_tx_ring *xdp_ring,
 bool ice_xmit_zc(struct ice_tx_ring *xdp_ring, struct xsk_buff_pool *xsk_pool)
 {
 	struct xdp_desc *descs = xsk_pool->tx_descs;
-	u32 nb_pkts, nb_processed = 0;
+	u32 nb_pkts, nb_processed = 0, packets;
 	unsigned int total_bytes = 0;
-	int budget;
+	u32 budget, cost = 1;
 
 	ice_clean_xdp_irq_zc(xdp_ring, xsk_pool);
 
@@ -801,26 +1167,38 @@ bool ice_xmit_zc(struct ice_tx_ring *xdp_ring, struct xsk_buff_pool *xsk_pool)
 	    !netif_running(xdp_ring->vsi->netdev))
 		return true;
 
-	budget = ICE_DESC_UNUSED(xdp_ring);
-	budget = min_t(u16, budget, ICE_RING_QUARTER(xdp_ring));
+	/* Reserve worst-case descriptors for each potential USO packet. */
+	if (xdp_ring->xsk_uso_pages)
+		cost = ice_xsk_uso_desc_cost(xsk_pool);
+	budget = min_t(u32, ICE_DESC_UNUSED(xdp_ring) / cost,
+		       ICE_RING_QUARTER(xdp_ring));
 
 	nb_pkts = xsk_tx_peek_release_desc_batch(xsk_pool, budget);
 	if (!nb_pkts)
 		return true;
 
-	if (xdp_ring->next_to_use + nb_pkts >= xdp_ring->count) {
-		nb_processed = xdp_ring->count - xdp_ring->next_to_use;
-		ice_fill_tx_hw_ring(xdp_ring, xsk_pool, descs, nb_processed,
-				    &total_bytes);
-		xdp_ring->next_to_use = 0;
+	if (xdp_ring->xsk_uso_pages) {
+		packets = ice_xmit_zc_metadata(xdp_ring, xsk_pool, nb_pkts,
+					       &total_bytes);
+	} else {
+		if (xdp_ring->next_to_use + nb_pkts >= xdp_ring->count) {
+			nb_processed = xdp_ring->count - xdp_ring->next_to_use;
+			ice_fill_tx_hw_ring(xdp_ring, xsk_pool, descs, nb_processed,
+					    &total_bytes);
+			xdp_ring->next_to_use = 0;
+		}
+
+		ice_fill_tx_hw_ring(xdp_ring, xsk_pool, &descs[nb_processed],
+				    nb_pkts - nb_processed, &total_bytes);
+		packets = nb_pkts;
 	}
 
-	ice_fill_tx_hw_ring(xdp_ring, xsk_pool, &descs[nb_processed],
-			    nb_pkts - nb_processed, &total_bytes);
-
-	ice_set_rs_bit(xdp_ring);
-	ice_xdp_ring_update_tail(xdp_ring);
-	ice_update_tx_ring_stats(xdp_ring, nb_pkts, total_bytes);
+	/* Metadata packets may all have been dropped. */
+	if (packets) {
+		ice_set_rs_bit(xdp_ring);
+		ice_xdp_ring_update_tail(xdp_ring);
+		ice_update_tx_ring_stats(xdp_ring, packets, total_bytes);
+	}
 
 	if (xsk_uses_need_wakeup(xsk_pool))
 		xsk_set_tx_need_wakeup(xsk_pool);
@@ -924,12 +1302,7 @@ void ice_xsk_clean_xdp_ring(struct ice_tx_ring *xdp_ring)
 	while (ntc != ntu) {
 		struct ice_tx_buf *tx_buf = &xdp_ring->tx_buf[ntc];
 
-		if (tx_buf->type == ICE_TX_BUF_XSK_TX) {
-			tx_buf->type = ICE_TX_BUF_EMPTY;
-			xsk_buff_free(tx_buf->xdp);
-		} else {
-			xsk_frames++;
-		}
+		xsk_frames += ice_clean_xsk_buf(xdp_ring, tx_buf);
 
 		ntc++;
 		if (ntc >= xdp_ring->count)

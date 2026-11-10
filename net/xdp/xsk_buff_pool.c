@@ -263,7 +263,9 @@ int xp_assign_dev(struct xsk_buff_pool *pool,
 		goto err_unreg_xsk;
 	}
 	pool->umem->zc = true;
-	pool->tx_uso_supported = false;
+	if (!netdev->xsk_tx_metadata_ops ||
+	    !netdev->xsk_tx_metadata_ops->tmo_supports_uso)
+		pool->tx_uso_supported = false;
 	pool->xdp_zc_max_segs = netdev->xdp_zc_max_segs;
 	return 0;
 

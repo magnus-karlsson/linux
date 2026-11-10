@@ -77,7 +77,8 @@ UDP Segmentation
 ================
 
 To request UDP segmentation offload (USO), bind the socket in
-``XDP_COPY`` mode and set ``XDP_TXMD_FLAGS_USO | XDP_TXMD_FLAGS_CHECKSUM``
+``XDP_COPY`` mode, or ``XDP_ZEROCOPY`` mode on a supporting driver, and set
+``XDP_TXMD_FLAGS_USO | XDP_TXMD_FLAGS_CHECKSUM``
 in the Tx metadata. Reserve at least 16 bytes of metadata and set
 ``XDP_TX_METADATA`` on the first descriptor of the packet.
 
@@ -126,15 +127,33 @@ packet partially in software first. In copy mode, these devices reject
 requests that produce more than one datagram, even though
 ``tx-udp-segmentation`` is reported as enabled.
 
-A USO request that is rejected is dropped: its buffers are returned
-through the completion ring and counted in the socket's ``tx_invalid_descs``
+A USO request that is rejected is dropped: its buffers are returned through
+the completion ring and counted in the socket's ``tx_invalid_descs``
 statistic. This is the only indication of the failure, whatever its cause:
 invalid metadata or headers, the MTU, segmentation limits, or a device
-without the offload. In copy mode, errors in other Tx metadata fail
-``sendmsg()`` and leave the descriptor on the Tx ring.
+without the offload. In zero-copy mode, dropped requests are only counted
+when a single socket transmits on the UMEM. In copy mode, errors in other Tx
+metadata fail ``sendmsg()`` and leave the descriptor on the Tx ring.
 
 USO cannot be combined with ``XDP_UMEM_TX_SW_CSUM`` or
 ``XDP_TXMD_FLAGS_TIMESTAMP``.
+
+For zero-copy mode, query ``tx-uso-zc`` through the netdev netlink interface
+before submitting requests. Supporting drivers copy headers into
+kernel-owned memory for validation and hardware preparation while leaving
+payload bytes in UMEM. The link-layer header before
+``request.network_offset`` is not checked against the IP header and is sent
+as is. Completion returns each submitted buffer address once, regardless of
+the number of generated datagrams. Zero-copy drivers without ``tx-uso-zc``
+do not drop USO requests; they ignore the Tx metadata and send the frame
+unsegmented and without offloads.
+
+In both modes, requests that produce more than one datagram also need
+``tx-udp-segmentation`` to be enabled on the device. In zero-copy mode, a
+packet may use at most ``xdp-zc-max-segs`` descriptors, as reported through
+the netdev netlink interface, and drivers may have further limits. For
+example, ice allows at most eight buffers per output datagram, counting the
+copied header.
 
 Launch Time
 ===========
@@ -198,7 +217,8 @@ USO with launch time
 
 Add ``XDP_TXMD_FLAGS_LAUNCH_TIME`` to the USO and checksum flags and set
 ``request.launch_time`` to schedule the segmented packet. This combination
-requires at least 24 bytes of Tx metadata.
+requires at least 24 bytes of Tx metadata and is only supported in copy
+mode; zero-copy mode rejects it.
 
 The launch time applies to the start of the segmented packet: the first
 output UDP datagram is scheduled, and subsequent datagrams follow according
@@ -229,6 +249,11 @@ Query the ``xsk-features`` attribute in
 - ``tx-timestamp``: device supports ``XDP_TXMD_FLAGS_TIMESTAMP``
 - ``tx-checksum``: device supports ``XDP_TXMD_FLAGS_CHECKSUM``
 - ``tx-launch-time-fifo``: device supports ``XDP_TXMD_FLAGS_LAUNCH_TIME``
+- ``tx-uso-zc``: driver supports ``XDP_TXMD_FLAGS_USO`` in zero-copy mode
+
+``tx-uso-zc`` reports driver capability. In both modes, segmentation is
+also switched by the device's ``tx-udp-segmentation`` feature, subject to
+the limits described in the UDP Segmentation section.
 
 See ``tools/net/ynl/samples/netdev.c`` on how to query this information.
 

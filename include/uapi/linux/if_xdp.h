@@ -134,9 +134,10 @@ struct xdp_options {
  */
 #define XDP_TXMD_FLAGS_LAUNCH_TIME		(1 << 2)
 
-/* Request UDP segmentation offload in XDP_COPY mode. Requires CHECKSUM.
+/* Request UDP segmentation offload. Requires CHECKSUM.
  * Segment size and IP header offset are in request.
- * With LAUNCH_TIME, scheduling applies to the start of the segmented packet.
+ * With LAUNCH_TIME (copy mode only), scheduling applies to the start of the
+ * segmented packet.
  */
 #define XDP_TXMD_FLAGS_USO			(1 << 3)
 

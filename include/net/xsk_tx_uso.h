@@ -10,6 +10,8 @@
 #include <net/checksum.h>
 #include <net/xsk_buff_pool.h>
 
+#define XSK_TX_USO_MAX_HEADER 256
+
 /*
  * Header offsets are relative to the start of the supplied Ethernet frame.
  * The caller provides header_len stable, linear bytes and the full packet len.
@@ -74,11 +76,29 @@ xsk_tx_prepare_gso_headers(void *outer_ip_header, struct udphdr *outer_udp,
 #ifdef CONFIG_XDP_SOCKETS
 int xsk_tx_uso_validate(const void *header, struct xsk_tx_uso_info *uso,
 			u32 mtu);
+int xsk_tx_uso_parse(struct xsk_buff_pool *pool, const struct xdp_desc *descs,
+		     u32 nr, struct xsk_tx_uso_info *info, void *header);
+void xsk_tx_uso_prepare_headers(const struct xsk_tx_uso_info *info,
+				void *header);
+
 #else
+
 static inline int
 xsk_tx_uso_validate(const void *header, struct xsk_tx_uso_info *uso, u32 mtu)
 {
 	return -EOPNOTSUPP;
+}
+
+static inline int
+xsk_tx_uso_parse(struct xsk_buff_pool *pool, const struct xdp_desc *descs,
+		 u32 nr, struct xsk_tx_uso_info *info, void *header)
+{
+	return 0;
+}
+
+static inline void
+xsk_tx_uso_prepare_headers(const struct xsk_tx_uso_info *info, void *header)
+{
 }
 #endif
 

@@ -499,6 +499,7 @@ struct ice_tx_ctx_desc {
 
 #define ICE_TXD_CTX_QW1_MSS_S	50
 #define ICE_TXD_CTX_MIN_MSS	64
+#define ICE_TXD_CTX_MAX_MSS	0x3FFF
 
 #define ICE_TXD_CTX_QW1_VSI_S	50
 #define ICE_TXD_CTX_QW1_VSI_M	(0x3FFULL << ICE_TXD_CTX_QW1_VSI_S)

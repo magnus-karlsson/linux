@@ -3309,6 +3309,8 @@ ice_set_ringparam(struct net_device *netdev, struct ethtool_ringparam *ring,
 		xdp_rings[i].count = new_tx_cnt;
 		xdp_rings[i].desc = NULL;
 		xdp_rings[i].tx_buf = NULL;
+		xdp_rings[i].xsk_uso_pages = NULL;
+		xdp_rings[i].xsk_uso_nr_pages = 0;
 		err = ice_setup_tx_ring(&xdp_rings[i]);
 		if (err) {
 			while (i--)
