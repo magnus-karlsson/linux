@@ -37,6 +37,7 @@ test_cpp
 *.ko
 *.tmp
 xskxceiver
+xsk_uso
 xdp_redirect_multi
 xdp_synproxy
 xdp_hw_metadata

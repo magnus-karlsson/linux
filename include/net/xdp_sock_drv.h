@@ -28,6 +28,7 @@ void xsk_tx_completed(struct xsk_buff_pool *pool, u32 nb_entries);
 bool xsk_tx_peek_desc(struct xsk_buff_pool *pool, struct xdp_desc *desc);
 u32 xsk_tx_peek_release_desc_batch(struct xsk_buff_pool *pool, u32 max);
 void xsk_tx_release(struct xsk_buff_pool *pool);
+void xsk_tx_invalid_descs(struct xsk_buff_pool *pool, u32 nb_descs);
 struct xsk_buff_pool *xsk_get_pool_from_qid(struct net_device *dev,
 					    u16 queue_id);
 void xsk_set_rx_need_wakeup(struct xsk_buff_pool *pool);
@@ -258,6 +259,7 @@ xsk_buff_raw_get_ctx(const struct xsk_buff_pool *pool, u64 addr, u32 options)
 		XDP_TXMD_FLAGS_TIMESTAMP | \
 		XDP_TXMD_FLAGS_CHECKSUM | \
 		XDP_TXMD_FLAGS_LAUNCH_TIME | \
+		XDP_TXMD_FLAGS_USO | \
 	0)
 
 static inline bool
@@ -265,11 +267,22 @@ xsk_buff_valid_tx_metadata(const struct xsk_buff_pool *pool,
 			   const struct xsk_tx_metadata *meta, u64 *flags)
 {
 	*flags = READ_ONCE(meta->flags);
+	if (*flags & XDP_TXMD_FLAGS_USO)
+		if (!pool->tx_uso_supported || pool->tx_metadata_len <
+		    offsetofend(struct xsk_tx_metadata, request.network_offset))
+			return false;
 	if (*flags & XDP_TXMD_FLAGS_LAUNCH_TIME)
 		if (pool->tx_metadata_len <
 		    offsetofend(struct xsk_tx_metadata, request.launch_time))
 			return false;
 	return !(*flags & ~XDP_TXMD_FLAGS_VALID);
+}
+
+/* USO requires checksum offload and cannot report a Tx timestamp. */
+static inline bool xsk_tx_uso_flags_valid(u64 flags)
+{
+	return (flags & XDP_TXMD_FLAGS_CHECKSUM) &&
+	       !(flags & XDP_TXMD_FLAGS_TIMESTAMP);
 }
 
 /**
@@ -367,6 +380,11 @@ static inline u32 xsk_tx_peek_release_desc_batch(struct xsk_buff_pool *pool, u32
 }
 
 static inline void xsk_tx_release(struct xsk_buff_pool *pool)
+{
+}
+
+static inline void xsk_tx_invalid_descs(struct xsk_buff_pool *pool,
+					u32 nb_descs)
 {
 }
 

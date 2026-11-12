@@ -30544,6 +30544,7 @@ F:	Documentation/networking/af_xdp.rst
 F:	include/net/netns/xdp.h
 F:	include/net/xdp_sock*
 F:	include/net/xsk_buff_pool.h
+F:	include/net/xsk_tx_uso.h
 F:	include/uapi/linux/if_xdp.h
 F:	include/uapi/linux/xdp_diag.h
 F:	net/xdp/

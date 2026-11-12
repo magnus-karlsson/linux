@@ -11,6 +11,7 @@
 
 #define pr_fmt(fmt) "AF_XDP: %s: " fmt, __func__
 
+#include <linux/if_vlan.h>
 #include <linux/if_xdp.h>
 #include <linux/init.h>
 #include <linux/sched/mm.h>
@@ -22,6 +23,7 @@
 #include <linux/net.h>
 #include <linux/netdevice.h>
 #include <linux/rculist.h>
+#include <linux/udp.h>
 #include <linux/uio.h>
 #include <linux/vmalloc.h>
 
@@ -31,6 +33,7 @@
 #include <net/netdev_lock.h>
 #include <net/netdev_rx_queue.h>
 #include <net/xdp.h>
+#include <net/xsk_tx_uso.h>
 
 #include "../core/dev.h"
 
@@ -555,6 +558,29 @@ void xsk_tx_release(struct xsk_buff_pool *pool)
 }
 EXPORT_SYMBOL(xsk_tx_release);
 
+/**
+ * xsk_tx_invalid_descs - account Tx descriptors rejected by the driver
+ * @pool: buffer pool the descriptors were consumed from
+ * @nb_descs: number of rejected descriptors
+ *
+ * Report descriptors that were consumed from the Tx ring but rejected by the
+ * driver in the tx_invalid_descs statistic. The driver must still complete
+ * them. With a shared umem the owning socket is unknown, so the descriptors
+ * are only accounted when a single socket transmits on @pool.
+ */
+void xsk_tx_invalid_descs(struct xsk_buff_pool *pool, u32 nb_descs)
+{
+	struct xdp_sock *xs;
+
+	rcu_read_lock();
+	xs = list_first_or_null_rcu(&pool->xsk_tx_list, struct xdp_sock,
+				    tx_list);
+	if (xs && list_is_singular(&pool->xsk_tx_list))
+		xs->tx->invalid_descs += nb_descs;
+	rcu_read_unlock();
+}
+EXPORT_SYMBOL(xsk_tx_invalid_descs);
+
 bool xsk_tx_peek_desc(struct xsk_buff_pool *pool, struct xdp_desc *desc)
 {
 	bool budget_exhausted = false;
@@ -985,39 +1011,107 @@ static void xsk_drop_skb(struct sk_buff *skb)
 	xs->skb = NULL;
 }
 
+static int xsk_skb_uso(struct sk_buff *skb)
+{
+	struct xsk_tx_uso_info uso = {
+		.metadata.request = {
+			.gso_size = skb_shinfo(skb)->gso_size,
+			.csum_start = skb_transport_offset(skb),
+			.network_offset = skb_network_offset(skb),
+		},
+		.header_len = skb_transport_offset(skb) + sizeof(struct udphdr),
+		.len = skb->len,
+	};
+	int depth, err;
+
+	if (!pskb_may_pull(skb, uso.header_len))
+		return -EINVAL;
+
+	err = xsk_tx_uso_validate(skb->data, &uso, READ_ONCE(skb->dev->mtu));
+	if (err)
+		return err;
+
+	skb_reset_mac_header(skb);
+	skb->protocol = eth_hdr(skb)->h_proto;
+	skb_reset_mac_len(skb);
+	/* skb drivers find L3 through the EtherType and VLAN tags. */
+	if (__vlan_get_protocol(skb, skb->protocol, &depth) != uso.protocol ||
+	    depth != skb_network_offset(skb))
+		return -EINVAL;
+	if (uso.gso_segs == 1) {
+		skb_gso_reset(skb);
+		return 0;
+	}
+
+	skb_shinfo(skb)->gso_segs = uso.gso_segs;
+	if (netif_needs_gso(skb, netif_skb_features(skb)))
+		return -EOPNOTSUPP;
+
+	return 0;
+}
+
+/* On failure, @drop tells whether the descriptor must be dropped because the
+ * request asked for USO. Other metadata errors are returned to user space.
+ */
 static int xsk_skb_metadata(struct sk_buff *skb, void *buffer,
 			    struct xdp_desc *desc, struct xsk_buff_pool *pool,
-			    u32 hr)
+			    u32 hr, bool *drop)
 {
 	struct xsk_tx_metadata *meta = NULL;
-	u16 csum_start, csum_offset;
+	int err = -EINVAL;
 	u64 flags;
 
+	*drop = false;
 	if (unlikely(pool->tx_metadata_len == 0))
 		return -EINVAL;
 
 	meta = buffer - pool->tx_metadata_len;
 	if (unlikely(!xsk_buff_valid_tx_metadata(pool, meta, &flags)))
-		return -EINVAL;
+		goto err;
+
+	if (flags & XDP_TXMD_FLAGS_USO) {
+		u16 nhoff = READ_ONCE(meta->request.network_offset);
+		u16 offset = READ_ONCE(meta->request.csum_offset);
+		u16 thoff = READ_ONCE(meta->request.csum_start);
+		u16 size = READ_ONCE(meta->request.gso_size);
+
+		if (!xsk_tx_uso_flags_valid(flags)) {
+			err = -EOPNOTSUPP;
+			goto err;
+		}
+		if (!size || size == GSO_BY_FRAGS ||
+		    nhoff < ETH_HLEN || thoff < nhoff ||
+		    thoff + sizeof(struct udphdr) > desc->len ||
+		    offset != offsetof(struct udphdr, check) ||
+		    hr + thoff > U16_MAX)
+			goto err;
+
+		skb_set_network_header(skb, nhoff);
+		skb_set_transport_header(skb, thoff);
+		skb_shinfo(skb)->gso_size = size;
+		skb_shinfo(skb)->gso_type = SKB_GSO_UDP_L4;
+	}
 
 	if (flags & XDP_TXMD_FLAGS_CHECKSUM) {
-		csum_start = READ_ONCE(meta->request.csum_start);
-		csum_offset = READ_ONCE(meta->request.csum_offset);
+		if (flags & XDP_TXMD_FLAGS_USO) {
+			skb->csum_start = skb_transport_offset(skb);
+			skb->csum_offset = offsetof(struct udphdr, check);
+		} else {
+			skb->csum_start = READ_ONCE(meta->request.csum_start);
+			skb->csum_offset = READ_ONCE(meta->request.csum_offset);
+		}
 
-		if (unlikely(csum_start + csum_offset +
+		if (unlikely(skb->csum_start + skb->csum_offset +
 			     sizeof(__sum16) > desc->len))
-			return -EINVAL;
+			goto err;
 
-		skb->csum_start = hr + csum_start;
-		skb->csum_offset = csum_offset;
+		skb->csum_start += hr;
 		skb->ip_summed = CHECKSUM_PARTIAL;
 
 		if (unlikely(pool->tx_sw_csum)) {
-			int err;
-
 			err = skb_checksum_help(skb);
 			if (err)
-				return err;
+				goto err;
 		}
 	}
 
@@ -1028,10 +1122,14 @@ static int xsk_skb_metadata(struct sk_buff *skb, void *buffer,
 	xsk_tx_metadata_to_compl(meta, &skb_shinfo(skb)->xsk_meta);
 
 	return 0;
+
+err:
+	*drop = flags & XDP_TXMD_FLAGS_USO;
+	return err;
 }
 
 static struct sk_buff *xsk_build_skb_zerocopy(struct xdp_sock *xs,
-					      struct xdp_desc *desc)
+					      struct xdp_desc *desc, bool *drop)
 {
 	struct xsk_buff_pool *pool = xs->pool;
 	u32 hr, len, ts, offset, copy, copied;
@@ -1053,7 +1151,8 @@ static struct sk_buff *xsk_build_skb_zerocopy(struct xdp_sock *xs,
 
 		skb_reserve(skb, hr);
 		if (desc->options & XDP_TX_METADATA) {
-			err = xsk_skb_metadata(skb, buffer, desc, pool, hr);
+			err = xsk_skb_metadata(skb, buffer, desc, pool, hr,
+					       drop);
 			if (unlikely(err)) {
 				kfree_skb(skb);
 				return ERR_PTR(err);
@@ -1106,15 +1205,19 @@ static struct sk_buff *xsk_build_skb_zerocopy(struct xdp_sock *xs,
 	return skb;
 }
 
+/* On error, @dropped tells whether the descriptor was consumed and completed
+ * as invalid rather than left on the Tx ring for the application to retry.
+ */
 static struct sk_buff *xsk_build_skb(struct xdp_sock *xs,
-				     struct xdp_desc *desc)
+				     struct xdp_desc *desc, bool *dropped)
 {
 	struct net_device *dev = xs->dev;
 	struct sk_buff *skb = xs->skb;
+	bool drop = false;
 	int err;
 
 	if (dev->priv_flags & IFF_TX_SKB_NO_LINEAR) {
-		skb = xsk_build_skb_zerocopy(xs, desc);
+		skb = xsk_build_skb_zerocopy(xs, desc, &drop);
 		if (IS_ERR(skb)) {
 			err = PTR_ERR(skb);
 			skb = NULL;
@@ -1143,7 +1246,7 @@ static struct sk_buff *xsk_build_skb(struct xdp_sock *xs,
 
 			if (desc->options & XDP_TX_METADATA) {
 				err = xsk_skb_metadata(skb, buffer, desc,
-						       xs->pool, hr);
+						       xs->pool, hr, &drop);
 				if (unlikely(err))
 					goto free_err;
 			}
@@ -1194,13 +1297,21 @@ free_err:
 	if (skb && !xs->skb)
 		kfree_skb(skb);
 
-	if (err == -EOVERFLOW) {
+	/* Invalid USO requests are dropped and completed. Other metadata
+	 * errors are returned so that the application can retry.
+	 */
+	*dropped = err == -EOVERFLOW || drop;
+	if (*dropped) {
 		if (xs->skb) {
 			/* Drop the packet */
 			xsk_inc_num_desc(xs->skb);
 			xsk_drop_skb(xs->skb);
 		} else {
-			xsk_cq_cancel_locked(xs->pool, 1);
+			if (err == -EOVERFLOW)
+				xsk_cq_cancel_locked(xs->pool, 1);
+			else
+				xsk_cq_submit_addr_single_locked(xs->pool,
+								 desc);
 			xs->tx->invalid_descs++;
 		}
 		xskq_cons_release(xs->tx);
@@ -1218,6 +1329,7 @@ static int __xsk_generic_xmit(struct sock *sk)
 	struct xdp_desc desc;
 	struct sk_buff *skb;
 	u32 cached_cons;
+	bool dropped;
 	u32 max_batch;
 	int err = 0;
 
@@ -1259,10 +1371,10 @@ static int __xsk_generic_xmit(struct sock *sk)
 			continue;
 		}
 
-		skb = xsk_build_skb(xs, &desc);
+		skb = xsk_build_skb(xs, &desc, &dropped);
 		if (IS_ERR(skb)) {
 			err = PTR_ERR(skb);
-			if (err != -EOVERFLOW)
+			if (!dropped)
 				goto out;
 			if (xp_mb_desc(&desc))
 				xs->drain_cont = true;
@@ -1275,6 +1387,15 @@ static int __xsk_generic_xmit(struct sock *sk)
 		if (xp_mb_desc(&desc)) {
 			xs->skb = skb;
 			continue;
+		}
+
+		if (skb_shinfo(skb)->gso_type & SKB_GSO_UDP_L4) {
+			err = xsk_skb_uso(skb);
+			if (err) {
+				xsk_drop_skb(skb);
+				err = 0;
+				continue;
+			}
 		}
 
 		err = __dev_direct_xmit(skb, xs->queue_id);

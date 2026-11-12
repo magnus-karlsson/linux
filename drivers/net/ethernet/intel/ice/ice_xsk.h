@@ -22,6 +22,9 @@ bool ice_xsk_any_rx_ring_ena(struct ice_vsi *vsi);
 void ice_xsk_clean_rx_ring(struct ice_rx_ring *rx_ring);
 void ice_xsk_clean_xdp_ring(struct ice_tx_ring *xdp_ring);
 bool ice_xmit_zc(struct ice_tx_ring *xdp_ring, struct xsk_buff_pool *xsk_pool);
+void ice_xsk_setup_metadata(struct net_device *netdev);
+int ice_xsk_cfg_uso_slots(struct ice_tx_ring *ring, struct xsk_buff_pool *pool);
+void ice_xsk_free_uso_slots(struct ice_tx_ring *ring);
 int ice_realloc_rx_xdp_bufs(struct ice_rx_ring *rx_ring, bool pool_present);
 void ice_qvec_cfg_msix(struct ice_vsi *vsi, struct ice_q_vector *q_vector,
 		       u16 qid);
@@ -75,6 +78,16 @@ ice_xsk_wakeup(struct net_device __always_unused *netdev,
 
 static inline void ice_xsk_clean_rx_ring(struct ice_rx_ring *rx_ring) { }
 static inline void ice_xsk_clean_xdp_ring(struct ice_tx_ring *xdp_ring) { }
+static inline void ice_xsk_setup_metadata(struct net_device *netdev) { }
+
+static inline int
+ice_xsk_cfg_uso_slots(struct ice_tx_ring __always_unused *ring,
+		      struct xsk_buff_pool __always_unused *pool)
+{
+	return 0;
+}
+
+static inline void ice_xsk_free_uso_slots(struct ice_tx_ring *ring) { }
 
 static inline int
 ice_realloc_rx_xdp_bufs(struct ice_rx_ring *rx_ring,

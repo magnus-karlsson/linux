@@ -2645,6 +2645,7 @@ void ice_map_xdp_rings(struct ice_vsi *vsi)
 	ice_for_each_rxq(vsi, q_idx) {
 		vsi->rx_rings[q_idx]->xdp_ring = ice_xdp_ring_from_qid(vsi,
 								       q_idx);
+		/* A failure is reported when the queues are configured. */
 		ice_tx_xsk_pool(vsi, q_idx);
 	}
 }
@@ -3463,6 +3464,7 @@ static void ice_set_ops(struct ice_vsi *vsi)
 			       NETDEV_XDP_ACT_XSK_ZEROCOPY |
 			       NETDEV_XDP_ACT_RX_SG;
 	netdev->xdp_zc_max_segs = ICE_MAX_BUF_TXD;
+	ice_xsk_setup_metadata(netdev);
 }
 
 /**

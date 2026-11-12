@@ -8,6 +8,7 @@
 #include <linux/prefetch.h>
 #include <linux/bpf_trace.h>
 #include <linux/net/intel/libie/rx.h>
+#include <net/xsk_tx_uso.h>
 #include <net/libeth/xdp.h>
 #include <net/dsfield.h>
 #include <net/mpls.h>
@@ -250,6 +251,7 @@ void ice_free_tx_ring(struct ice_tx_ring *tx_ring)
 	u32 size;
 
 	ice_clean_tx_ring(tx_ring);
+	ice_xsk_free_uso_slots(tx_ring);
 	devm_kfree(tx_ring->dev, tx_ring->tx_buf);
 	tx_ring->tx_buf = NULL;
 
@@ -1625,7 +1627,6 @@ int ice_tx_csum(struct ice_tx_buf *first, struct ice_tx_offload_params *off)
 
 	/* compute outer L2 header size */
 	l2_len = ip.hdr - skb->data;
-	offset = (l2_len / 2) << ICE_TX_DESC_LEN_MACLEN_S;
 
 	/* set the tx_flags to indicate the IP protocol type. this is
 	 * required so that checksum header computation below is accurate.
@@ -1737,7 +1738,7 @@ int ice_tx_csum(struct ice_tx_buf *first, struct ice_tx_offload_params *off)
 
 	/* compute inner L3 header size */
 	l3_len = l4.hdr - ip.hdr;
-	offset |= (l3_len / 4) << ICE_TX_DESC_LEN_IPLEN_S;
+	offset = ice_build_tx_desc_offset(l2_len, l3_len, 0);
 
 	if ((tx_ring->netdev->features & NETIF_F_HW_CSUM) &&
 	    !(first->tx_flags & ICE_TX_FLAGS_TSO) &&
@@ -1768,26 +1769,24 @@ int ice_tx_csum(struct ice_tx_buf *first, struct ice_tx_offload_params *off)
 	case IPPROTO_TCP:
 		/* enable checksum offloads */
 		cmd |= ICE_TX_DESC_CMD_L4T_EOFT_TCP;
-		l4_len = l4.tcp->doff;
-		offset |= l4_len << ICE_TX_DESC_LEN_L4_LEN_S;
+		l4_len = l4.tcp->doff * sizeof(u32);
 		break;
 	case IPPROTO_UDP:
 		/* enable UDP checksum offload */
 		cmd |= ICE_TX_DESC_CMD_L4T_EOFT_UDP;
-		l4_len = (sizeof(struct udphdr) >> 2);
-		offset |= l4_len << ICE_TX_DESC_LEN_L4_LEN_S;
+		l4_len = sizeof(struct udphdr);
 		break;
 	case IPPROTO_SCTP:
 		/* enable SCTP checksum offload */
 		cmd |= ICE_TX_DESC_CMD_L4T_EOFT_SCTP;
-		l4_len = sizeof(struct sctphdr) >> 2;
-		offset |= l4_len << ICE_TX_DESC_LEN_L4_LEN_S;
+		l4_len = sizeof(struct sctphdr);
 		break;
 
 	default:
 		goto checksum_sw_fb;
 	}
 
+	offset = ice_build_tx_desc_offset(l2_len, l3_len, l4_len);
 	off->td_cmd |= cmd;
 	off->td_offset |= offset;
 	return 1;
@@ -1851,7 +1850,11 @@ int ice_tso(struct ice_tx_buf *first, struct ice_tx_offload_params *off)
 		struct udphdr *udp;
 		unsigned char *hdr;
 	} l4;
+	struct udphdr *outer_udp = NULL;
+	__sum16 *transport_checksum;
 	u64 cd_mss, cd_tso_len;
+	void *outer_ip = NULL;
+	u32 outer_udp_len = 0;
 	__be16 protocol;
 	u32 paylen;
 	u8 l4_start;
@@ -1875,44 +1878,26 @@ int ice_tso(struct ice_tx_buf *first, struct ice_tx_offload_params *off)
 		ip.hdr = skb_network_header(skb);
 	l4.hdr = skb_checksum_start(skb);
 
-	/* initialize outer IP header fields */
-	if (ip.v4->version == 4) {
-		ip.v4->tot_len = 0;
-		ip.v4->check = 0;
-	} else {
-		ip.v6->payload_len = 0;
-	}
-
 	if (skb_shinfo(skb)->gso_type & (SKB_GSO_GRE |
 					 SKB_GSO_GRE_CSUM |
 					 SKB_GSO_IPXIP4 |
 					 SKB_GSO_IPXIP6 |
 					 SKB_GSO_UDP_TUNNEL |
 					 SKB_GSO_UDP_TUNNEL_CSUM)) {
+		outer_ip = ip.hdr;
+
 		if (!(skb_shinfo(skb)->gso_type & SKB_GSO_PARTIAL) &&
 		    (skb_shinfo(skb)->gso_type & SKB_GSO_UDP_TUNNEL_CSUM)) {
-			udp_set_len_short(l4.udp, 0);
-
 			/* determine offset of outer transport header */
 			l4_start = (u8)(l4.hdr - skb->data);
 
-			/* remove payload length from outer checksum */
-			paylen = skb->len - l4_start;
-			csum_replace_by_diff(&l4.udp->check,
-					     (__force __wsum)htonl(paylen));
+			outer_udp = l4.udp;
+			outer_udp_len = skb->len - l4_start;
 		}
 
 		/* reset pointers to inner headers */
 		ip.hdr = skb_inner_network_header(skb);
 		l4.hdr = skb_inner_transport_header(skb);
-
-		/* initialize inner IP header fields */
-		if (ip.v4->version == 4) {
-			ip.v4->tot_len = 0;
-			ip.v4->check = 0;
-		} else {
-			ip.v6->payload_len = 0;
-		}
 	}
 
 	/* determine offset of transport header */
@@ -1922,16 +1907,16 @@ int ice_tso(struct ice_tx_buf *first, struct ice_tx_offload_params *off)
 	paylen = skb->len - l4_start;
 
 	if (skb_shinfo(skb)->gso_type & SKB_GSO_UDP_L4) {
-		csum_replace_by_diff(&l4.udp->check,
-				     (__force __wsum)htonl(paylen));
+		transport_checksum = &l4.udp->check;
 		/* compute length of UDP segmentation header */
-		off->header_len = (u8)sizeof(l4.udp) + l4_start;
+		off->header_len = sizeof(*l4.udp) + l4_start;
 	} else {
-		csum_replace_by_diff(&l4.tcp->check,
-				     (__force __wsum)htonl(paylen));
+		transport_checksum = &l4.tcp->check;
 		/* compute length of TCP segmentation header */
 		off->header_len = (u8)((l4.tcp->doff * 4) + l4_start);
 	}
+	xsk_tx_prepare_gso_headers(outer_ip, outer_udp, outer_udp_len, ip.hdr,
+				   transport_checksum, paylen);
 
 	/* update gso_segs and bytecount */
 	first->gso_segs = skb_shinfo(skb)->gso_segs;
@@ -1941,10 +1926,8 @@ int ice_tso(struct ice_tx_buf *first, struct ice_tx_offload_params *off)
 	cd_mss = skb_shinfo(skb)->gso_size;
 
 	/* record cdesc_qw1 with TSO parameters */
-	off->cd_qw1 |= (u64)(ICE_TX_DESC_DTYPE_CTX |
-			     (ICE_TX_CTX_DESC_TSO << ICE_TXD_CTX_QW1_CMD_S) |
-			     (cd_tso_len << ICE_TXD_CTX_QW1_TSO_LEN_S) |
-			     (cd_mss << ICE_TXD_CTX_QW1_MSS_S));
+	off->cd_qw1 |= ICE_TX_DESC_DTYPE_CTX |
+		       ice_build_tso_ctx_qw1(cd_tso_len, cd_mss);
 	first->tx_flags |= ICE_TX_FLAGS_TSO;
 	return 1;
 }

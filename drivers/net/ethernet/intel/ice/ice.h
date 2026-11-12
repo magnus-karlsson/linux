@@ -833,16 +833,22 @@ static inline void ice_rx_xsk_pool(struct ice_rx_ring *ring)
  * carries a pointer to one of these XDP rings for its own purposes, such as
  * handling XDP_TX action, therefore we can piggyback here on the
  * rx_ring->xdp_ring assignment that was done during XDP rings initialization.
+ * The ring must be stopped, as its USO header slots are matched to the pool.
+ *
+ * Return: 0 on success, negative on failure.
  */
-static inline void ice_tx_xsk_pool(struct ice_vsi *vsi, u16 qid)
+static inline int ice_tx_xsk_pool(struct ice_vsi *vsi, u16 qid)
 {
+	struct xsk_buff_pool *pool;
 	struct ice_tx_ring *ring;
 
 	ring = vsi->rx_rings[qid]->xdp_ring;
 	if (!ring)
-		return;
+		return 0;
 
-	WRITE_ONCE(ring->xsk_pool, ice_get_xp_from_qid(vsi, qid));
+	pool = ice_get_xp_from_qid(vsi, qid);
+	WRITE_ONCE(ring->xsk_pool, pool);
+	return ice_xsk_cfg_uso_slots(ring, pool);
 }
 
 /**
