@@ -240,6 +240,8 @@ $(warning excluding xdp_hw_metadata, bpftool not installed or not working)
 endif
 
 TEST_GEN_FILES += $(COND_GEN_FILES)
+# Needs root and a NIC with loopback or a connected peer; see the source.
+TEST_GEN_FILES += xsk_uso
 
 TEST_INCLUDES := forwarding/lib.sh
 
@@ -271,5 +273,11 @@ $(OUTPUT)/xdp_hw_metadata: xdp_hw_metadata.c xdp_metadata.h lib/xsk/xsk.c \
 			   lib/xsk/xsk.h $(OUTPUT)/xdp_hw_metadata.skel.h $(BPFOBJ)
 	$(call msg,CC,,$@)
 	$(Q)$(CC) -I$(top_srcdir)/tools/include $(CFLAGS) -I$(OUTPUT) \
+		-I$(SCRATCH_DIR)/include \
+		$(filter %.c,$^) $(BPFOBJ) $(LDLIBS) -lelf -lz -o $@
+
+$(OUTPUT)/xsk_uso: xsk_uso.c lib/xsk/xsk.c lib/xsk/xsk.h $(BPFOBJ)
+	$(call msg,CC,,$@)
+	$(Q)$(CC) -I$(top_srcdir)/tools/include $(CFLAGS) \
 		-I$(SCRATCH_DIR)/include \
 		$(filter %.c,$^) $(BPFOBJ) $(LDLIBS) -lelf -lz -o $@

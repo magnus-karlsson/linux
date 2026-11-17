@@ -10,6 +10,7 @@
 #include "ice.h"
 #include "ice_base.h"
 #include "ice_lib.h"
+#include "ice_txrx_lib.h"
 #include "ice_fltr.h"
 #include "ice_dcb_lib.h"
 #include "ice_dcb_nl.h"
@@ -2645,6 +2646,7 @@ void ice_map_xdp_rings(struct ice_vsi *vsi)
 	ice_for_each_rxq(vsi, q_idx) {
 		vsi->rx_rings[q_idx]->xdp_ring = ice_xdp_ring_from_qid(vsi,
 								       q_idx);
+		/* A failure is reported when the queues are configured. */
 		ice_tx_xsk_pool(vsi, q_idx);
 	}
 }
@@ -3463,6 +3465,7 @@ static void ice_set_ops(struct ice_vsi *vsi)
 			       NETDEV_XDP_ACT_XSK_ZEROCOPY |
 			       NETDEV_XDP_ACT_RX_SG;
 	netdev->xdp_zc_max_segs = ICE_MAX_BUF_TXD;
+	ice_xsk_setup_metadata(netdev);
 }
 
 /**
@@ -9748,12 +9751,8 @@ ice_features_check(struct sk_buff *skb,
 	if (gso && (skb_shinfo(skb)->gso_size < ICE_TXD_CTX_MIN_MSS))
 		features &= ~NETIF_F_GSO_MASK;
 
-	len = skb_network_offset(skb);
-	if (len > ICE_TXD_MACLEN_MAX || len & 0x1)
-		goto out_rm_features;
-
-	len = skb_network_header_len(skb);
-	if (len > ICE_TXD_IPLEN_MAX || len & 0x1)
+	if (!ice_tx_hdr_lens_ok(skb_network_offset(skb),
+				skb_network_header_len(skb)))
 		goto out_rm_features;
 
 	if (skb->encapsulation) {

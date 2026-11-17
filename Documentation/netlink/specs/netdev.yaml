@@ -85,6 +85,10 @@ definitions:
         name: tx-launch-time-fifo
         doc: >-
           Launch time HW offload is supported by the driver.
+      -
+        name: tx-uso-zc
+        doc: >-
+          UDP segmentation HW offload is supported for AF_XDP zero-copy.
   -
     name: queue-type
     type: enum

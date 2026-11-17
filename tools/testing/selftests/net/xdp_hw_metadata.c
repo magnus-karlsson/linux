@@ -14,6 +14,7 @@
  * - TX HW timestamp is requested and reported back upon completion
  * - TX checksum is requested
  * - TX launch time HW offload is requested for transmission
+ * - TX UDP segmentation offload (USO) is optionally requested
  */
 
 #include "xdp_hw_metadata.skel.h"
@@ -80,6 +81,7 @@ __u64 last_xdp_rx_timestamp;
 __u64 last_launch_time;
 __u64 launch_time_delta_to_hw_rx_timestamp;
 int launch_time_queue;
+__u16 uso_gso_size;
 
 #define run_command(cmd, ...)					\
 ({								\
@@ -440,7 +442,9 @@ static void ping_pong(struct xsk *xsk, void *rx_packet, clockid_t clock_id)
 
 	meta = data - sizeof(struct xsk_tx_metadata);
 	memset(meta, 0, sizeof(*meta));
-	meta->flags = XDP_TXMD_FLAGS_TIMESTAMP;
+	/* USO cannot be combined with a TX timestamp request */
+	if (!uso_gso_size)
+		meta->flags = XDP_TXMD_FLAGS_TIMESTAMP;
 
 	eth = rx_packet;
 
@@ -487,6 +491,19 @@ static void ping_pong(struct xsk *xsk, void *rx_packet, clockid_t clock_id)
 	printf("%p: ping-pong with csum=%04x (want %04x) csum_start=%d csum_offset=%d\n",
 	       xsk, ntohs(udph->check), ntohs(want_csum),
 	       meta->request.csum_start, meta->request.csum_offset);
+
+	/* The device splits the UDP payload into datagrams of at most
+	 * gso_size bytes. It needs checksum offload and the IP header offset.
+	 * The IP and UDP lengths and the UDP checksum seed above describe the
+	 * whole packet, as USO requires.
+	 */
+	if (uso_gso_size) {
+		meta->flags |= XDP_TXMD_FLAGS_USO;
+		meta->request.gso_size = uso_gso_size;
+		meta->request.network_offset = sizeof(*eth);
+		printf("%p: ping-pong with USO gso_size=%u network_offset=%u\n",
+		       xsk, meta->request.gso_size, meta->request.network_offset);
+	}
 
 	/* Set the value of launch time */
 	if (launch_time_delta_to_hw_rx_timestamp) {
@@ -723,6 +740,9 @@ static void print_usage(void)
 		"        default: 0 ns (launch time request is disabled)\n"
 		"  -L    Tx Queue to be enabled with launch time offload\n"
 		"        default: 0 (Tx Queue 0)\n"
+		"  -u    Request USO for the reply, splitting its UDP payload\n"
+		"        into datagrams of at most this many bytes\n"
+		"        (disables the TX timestamp, not compatible with -l)\n"
 		"Generate test packets on the other machine with:\n"
 		"  echo -n xdp | nc -u -q1 <dst_ip> 9091\n";
 
@@ -733,7 +753,7 @@ static void read_args(int argc, char *argv[])
 {
 	int opt;
 
-	while ((opt = getopt(argc, argv, "chmrl:L:")) != -1) {
+	while ((opt = getopt(argc, argv, "chmrl:L:u:")) != -1) {
 		switch (opt) {
 		case 'c':
 			bind_flags &= ~XDP_USE_NEED_WAKEUP;
@@ -755,6 +775,14 @@ static void read_args(int argc, char *argv[])
 		case 'L':
 			launch_time_queue = atoll(optarg);
 			break;
+		case 'u': {
+			unsigned long size = strtoul(optarg, NULL, 0);
+
+			if (!size || size > UINT16_MAX)
+				error(-1, EINVAL, "Invalid USO segment size");
+			uso_gso_size = size;
+			break;
+		}
 		case '?':
 			if (isprint(optopt))
 				fprintf(stderr, "Unknown option: -%c\n", optopt);
@@ -764,6 +792,9 @@ static void read_args(int argc, char *argv[])
 			error(-1, opterr, "Command line options error");
 		}
 	}
+
+	if (uso_gso_size && launch_time_delta_to_hw_rx_timestamp)
+		error(-1, EINVAL, "USO cannot be combined with launch time");
 
 	if (optind >= argc) {
 		fprintf(stderr, "No device name provided\n");

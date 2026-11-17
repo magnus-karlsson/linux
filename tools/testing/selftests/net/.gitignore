@@ -64,3 +64,4 @@ udpgso_bench_rx
 udpgso_bench_tx
 xdp_hw_metadata
 xdp_hw_metadata.skel.h
+xsk_uso

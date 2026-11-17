@@ -76,13 +76,17 @@
 
 /**
  * enum ice_tx_buf_type - type of &ice_tx_buf to act on Tx completion
- * @ICE_TX_BUF_EMPTY: unused OR XSk frame, no action required
+ * @ICE_TX_BUF_EMPTY: unused OR XSk frame, no action required, one completion
  * @ICE_TX_BUF_DUMMY: dummy Flow Director packet, unmap and kfree()
  * @ICE_TX_BUF_FRAG: mapped skb OR &xdp_buff frag, only unmap DMA
  * @ICE_TX_BUF_SKB: &sk_buff, unmap and consume_skb(), update stats
  * @ICE_TX_BUF_XDP_TX: &xdp_buff, unmap and page_frag_free(), stats
  * @ICE_TX_BUF_XDP_XMIT: &xdp_frame, unmap and xdp_return_frame(), stats
  * @ICE_TX_BUF_XSK_TX: &xdp_buff on XSk queue, xsk_buff_free(), stats
+ * @ICE_TX_BUF_XSK_USO: XSk USO context, sync header slot for the CPU
+ * @ICE_TX_BUF_XSK_DROP: XSk frame whose completions differ from its descriptor
+ *                       count, from dropped frames or split buffers
+ * @ICE_TX_BUF_XSK_DESC: XSk metadata-path frame, @xsk_completions completions
  */
 enum ice_tx_buf_type {
 	ICE_TX_BUF_EMPTY	= 0U,
@@ -92,6 +96,9 @@ enum ice_tx_buf_type {
 	ICE_TX_BUF_XDP_TX,
 	ICE_TX_BUF_XDP_XMIT,
 	ICE_TX_BUF_XSK_TX,
+	ICE_TX_BUF_XSK_USO,
+	ICE_TX_BUF_XSK_DROP,
+	ICE_TX_BUF_XSK_DESC,
 };
 
 struct ice_tx_buf {
@@ -109,6 +116,7 @@ struct ice_tx_buf {
 	union {
 		unsigned int gso_segs;
 		unsigned int nr_frags;	/* used for mbuf XDP */
+		u32 xsk_completions;	/* used for XSk metadata path */
 	};
 	u32 tx_flags:12;
 	u32 type:4;			/* &ice_tx_buf_type */
@@ -346,12 +354,22 @@ struct ice_rx_ring {
 	__cacheline_group_end_aligned(cold);
 } ____cacheline_internodealigned_in_smp;
 
+/* One DMA-mapped page of USO header slots. */
+struct ice_xsk_uso_page {
+	void *addr;
+	dma_addr_t dma;
+};
+
 struct ice_tx_ring {
 	__cacheline_group_begin_aligned(read_mostly);
 	void *desc;			/* Descriptor ring memory */
 	struct device *dev;		/* Used for DMA mapping */
 	u8 __iomem *tail;
 	struct ice_tx_buf *tx_buf;
+	struct ice_xsk_uso_page *xsk_uso_pages;	/* USO header slots */
+	u16 xsk_uso_slot_stride;
+	u16 xsk_uso_slots_per_page;
+	u32 xsk_uso_nr_pages;
 
 	struct ice_q_vector *q_vector;	/* Backreference to associated vector */
 	struct net_device *netdev;	/* netdev ring maps to */
@@ -377,6 +395,7 @@ struct ice_tx_ring {
 	u16 next_to_clean;
 
 	u16 xdp_tx_active;
+	u16 xsk_uso_active;
 	spinlock_t tx_lock;
 	__cacheline_group_end_aligned(read_write);
 
